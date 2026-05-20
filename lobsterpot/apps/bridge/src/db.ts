@@ -1,12 +1,31 @@
 import Database from "better-sqlite3";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Conversation, Message, PublicBridgeEvent } from "@lobsterpot/protocol";
 import { createId, createToken, nowIso, sha256 } from "@lobsterpot/shared";
 
 const currentDir = dirname(fileURLToPath(import.meta.url));
-const migrationPath = join(currentDir, "../migrations/0001_initial.sql");
+const migrationsDir = join(currentDir, "../migrations");
+
+type DeviceRow = {
+  id: string;
+  name: string | null;
+  public_key: string | null;
+  token_hash: string;
+  pairing_code_id: string | null;
+  revoked_at: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+type PairingCodeRow = {
+  id: string;
+  code: string;
+  used_at: string | null;
+  expires_at: string;
+  created_at: string;
+};
 
 type BridgeTokenRow = {
   id: string;
@@ -55,6 +74,19 @@ export type BridgeTokenCreated = {
   createdAt: string;
 };
 
+export type DeviceCreated = {
+  id: string;
+  token: string;
+  createdAt: string;
+};
+
+export type PairingStarted = {
+  id: string;
+  code: string;
+  expiresAt: string;
+};
+
+
 export class BridgeDatabase {
   readonly db: Database.Database;
 
@@ -70,8 +102,20 @@ export class BridgeDatabase {
   }
 
   migrate(): void {
-    const sql = readFileSync(migrationPath, "utf8");
-    this.db.exec(sql);
+    const files = readdirSync(migrationsDir)
+      .filter((f) => f.endsWith(".sql"))
+      .sort();
+    for (const file of files) {
+      const sql = readFileSync(join(migrationsDir, file), "utf8");
+      // Wrap each migration in a savepoint so partial failures are isolated
+      try {
+        this.db.exec(sql);
+      } catch (err) {
+        // ALTER TABLE … ADD COLUMN throws if column already exists; swallow those safely
+        const msg = (err as Error).message ?? "";
+        if (!msg.includes("duplicate column name")) throw err;
+      }
+    }
   }
 
   createBridgeToken(label?: string): BridgeTokenCreated {
@@ -182,11 +226,14 @@ export class BridgeDatabase {
   recordEvent(input: { direction: "in" | "out"; type: string; conversationId?: string | null; payload: unknown }): PublicBridgeEvent {
     const id = createId();
     const now = nowIso();
-    const cursor = `${Date.now()}-${id}`;
-    this.db.prepare(`
+    // Insert with a placeholder cursor; use the SQLite ROWID (auto-increment) for
+    // strict monotonic ordering even when multiple events land in the same millisecond.
+    const info = this.db.prepare(`
       INSERT INTO events (id, cursor, direction, type, conversation_id, payload_json, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(id, cursor, input.direction, input.type, input.conversationId ?? null, JSON.stringify(input.payload), now);
+      VALUES (?, '', ?, ?, ?, ?, ?)
+    `).run(id, input.direction, input.type, input.conversationId ?? null, JSON.stringify(input.payload), now);
+    const cursor = String((info as { lastInsertRowid: number }).lastInsertRowid).padStart(20, "0");
+    this.db.prepare(`UPDATE events SET cursor = ? WHERE id = ?`).run(cursor, id);
     return {
       id,
       cursor,
@@ -195,6 +242,51 @@ export class BridgeDatabase {
       payload: input.payload,
       createdAt: now
     };
+  }
+
+  // ── Device auth ──────────────────────────────────────────────────────────
+
+  createPairingCode(): PairingStarted {
+    const id = createId();
+    const code = Math.random().toString(36).slice(2, 10).toUpperCase();
+    const expiresAt = new Date(Date.now() + 10 * 60_000).toISOString();
+    const createdAt = nowIso();
+    this.db.prepare(`
+      INSERT INTO pairing_codes (id, code, expires_at, created_at)
+      VALUES (?, ?, ?, ?)
+    `).run(id, code, expiresAt, createdAt);
+    return { id, code, expiresAt };
+  }
+
+  consumePairingCode(code: string): PairingCodeRow | null {
+    const row = this.db.prepare(`
+      SELECT * FROM pairing_codes
+      WHERE code = ? AND used_at IS NULL AND expires_at > ?
+    `).get(code, nowIso()) as PairingCodeRow | undefined;
+    if (!row) return null;
+    this.db.prepare(`UPDATE pairing_codes SET used_at = ? WHERE id = ?`).run(nowIso(), row.id);
+    return row;
+  }
+
+  createDevice(pairingCodeId: string): DeviceCreated {
+    const id = createId();
+    const token = createToken("device");
+    const now = nowIso();
+    this.db.prepare(`
+      INSERT INTO devices (id, token_hash, pairing_code_id, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(id, sha256(token), pairingCodeId, now, now);
+    return { id, token, createdAt: now };
+  }
+
+  validateDeviceToken(token: string): DeviceRow | null {
+    return this.db.prepare(`
+      SELECT * FROM devices WHERE token_hash = ? AND revoked_at IS NULL LIMIT 1
+    `).get(sha256(token)) as DeviceRow | undefined ?? null;
+  }
+
+  revokeDevice(id: string): void {
+    this.db.prepare(`UPDATE devices SET revoked_at = ?, updated_at = ? WHERE id = ?`).run(nowIso(), nowIso(), id);
   }
 
   listEventsAfter(cursor?: string | null, limit = 100): PublicBridgeEvent[] {
