@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 /// HTTP + SSE client for the LobsterPot bridge.
 /// All network calls are performed with async/await URLSession APIs.
@@ -160,12 +161,41 @@ final class BridgeClient {
         try await get("/api/setup/snippet")
     }
 
-    func startPairing() async throws -> PairingStartResponse {
-        try await post("/api/devices/pair/start", body: [:])
+    /// Generates a PKCE code verifier, sends the challenge to the bridge, and returns
+    /// both the server response and the raw code verifier (needed for `finishPairing`).
+    func startPairing() async throws -> (response: PairingStartResponse, codeVerifier: String) {
+        let codeVerifier = generateCodeVerifier()
+        let codeChallenge = sha256Hex(codeVerifier)
+        let response: PairingStartResponse = try await post(
+            "/api/devices/pair/start",
+            body: ["codeChallenge": codeChallenge]
+        )
+        return (response, codeVerifier)
     }
 
-    func finishPairing(pairingId: String, code: String) async throws -> PairingFinishResponse {
-        try await post("/api/devices/pair/finish", body: ["pairingId": pairingId, "code": code])
+    func finishPairing(pairingId: String, code: String, codeVerifier: String) async throws -> PairingFinishResponse {
+        try await post("/api/devices/pair/finish", body: [
+            "pairingId": pairingId,
+            "code": code,
+            "codeVerifier": codeVerifier
+        ])
+    }
+
+    // MARK: - PKCE helpers
+
+    private func generateCodeVerifier() -> String {
+        var bytes = [UInt8](repeating: 0, count: 32)
+        _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        return Data(bytes).base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+    }
+
+    private func sha256Hex(_ input: String) -> String {
+        let data = Data(input.utf8)
+        let digest = SHA256.hash(data: data)
+        return digest.map { String(format: "%02x", $0) }.joined()
     }
 
     // MARK: - Generic HTTP helpers

@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import type { MiddlewareHandler } from "hono";
 import { streamSSE } from "hono/streaming";
-import { z } from "zod";
+import { z, ZodError } from "zod";
 import { inboundMessageSchema } from "@lobsterpot/protocol";
 import { createId, nowIso, normalizeBaseUrl } from "@lobsterpot/shared";
 import type { BridgeConfig } from "./config.js";
@@ -9,11 +9,65 @@ import type { BridgeDatabase } from "./db.js";
 import type { EventBus } from "./eventBus.js";
 import type { PluginHub } from "./pluginHub.js";
 
+// ── Rate limiter ──────────────────────────────────────────────────────────────
+
+/**
+ * Simple in-memory sliding-window rate limiter.
+ * Not cluster-safe; adequate for single-process bridge deployments.
+ */
+class RateLimiter {
+  private readonly counts = new Map<string, { count: number; resetAt: number }>();
+
+  constructor(
+    private readonly max: number,
+    private readonly windowMs: number
+  ) {}
+
+  /** Returns true if the request is allowed, false if rate-limited. */
+  check(key: string): boolean {
+    const now = Date.now();
+    const entry = this.counts.get(key);
+    if (!entry || now >= entry.resetAt) {
+      this.counts.set(key, { count: 1, resetAt: now + this.windowMs });
+      return true;
+    }
+    if (entry.count >= this.max) return false;
+    entry.count++;
+    return true;
+  }
+
+  /** Periodically prune expired entries to avoid unbounded memory growth. */
+  prune(): void {
+    const now = Date.now();
+    for (const [key, entry] of this.counts) {
+      if (now >= entry.resetAt) this.counts.delete(key);
+    }
+  }
+}
+
+function clientIp(req: Request): string {
+  return (
+    req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ??
+    req.headers.get("x-real-ip") ??
+    "unknown"
+  );
+}
+
+function rateLimitMiddleware(limiter: RateLimiter): MiddlewareHandler {
+  return async (c, next) => {
+    if (!limiter.check(clientIp(c.req.raw))) {
+      return c.json({ error: "rate_limited" }, 429);
+    }
+    await next();
+  };
+}
+
 export type RouteDeps = {
   config: BridgeConfig;
   database: BridgeDatabase;
   events: EventBus;
   pluginHub: PluginHub;
+  pushRelay?: import("./pushRelay.js").PushRelayClient;
 };
 
 // ── Validation schemas ────────────────────────────────────────────────────────
@@ -41,6 +95,7 @@ const sendMessageSchema = z.object({
 /**
  * Routes that require a valid device Bearer token.
  * Unauthenticated paths: /healthz, /api/status, /api/setup/*, /api/devices/pair/*, /
+ * Sets the "deviceId" context variable for downstream handlers.
  */
 function requireDeviceAuth(database: BridgeDatabase): MiddlewareHandler {
   return async (c, next) => {
@@ -53,6 +108,7 @@ function requireDeviceAuth(database: BridgeDatabase): MiddlewareHandler {
     if (!device) {
       return c.json({ error: "invalid_token" }, 401);
     }
+    c.set("deviceId" as never, device.id as never);
     await next();
   };
 }
@@ -61,6 +117,29 @@ function requireDeviceAuth(database: BridgeDatabase): MiddlewareHandler {
 
 export function createApp(deps: RouteDeps): Hono {
   const app = new Hono();
+
+  // Convert Zod validation errors to 400 responses
+  app.onError((err, c) => {
+    if (err instanceof ZodError) {
+      return c.json({ error: "invalid_request", issues: err.issues }, 400);
+    }
+    throw err;
+  });
+
+  // Rate limiter instances (per-route, per-IP)
+  // Pairing start: 10 attempts per 5 min — prevents code flooding
+  const pairStartLimiter = new RateLimiter(10, 5 * 60_000);
+  // Pairing finish: 20 attempts per 5 min — prevents brute-forcing short codes
+  const pairFinishLimiter = new RateLimiter(20, 5 * 60_000);
+  // Token generation: 5 per hour — setup-time only
+  const setupTokenLimiter = new RateLimiter(5, 60 * 60_000);
+
+  // Prune expired rate-limit buckets every 10 minutes
+  setInterval(() => {
+    pairStartLimiter.prune();
+    pairFinishLimiter.prune();
+    setupTokenLimiter.prune();
+  }, 10 * 60_000).unref();
 
   // Public routes
   app.get("/healthz", (c) => c.json({ ok: true, service: "lobsterpot-bridge", now: nowIso() }));
@@ -74,7 +153,7 @@ export function createApp(deps: RouteDeps): Hono {
   }));
 
   // Token generation (public — called during initial bridge setup before any devices exist)
-  app.post("/api/setup/token", async (c) => {
+  app.post("/api/setup/token", rateLimitMiddleware(setupTokenLimiter), async (c) => {
     const body = await readJson(c.req.raw);
     const label = z.object({ label: z.string().optional() }).partial().parse(body).label;
     const token = deps.database.createBridgeToken(label);
@@ -100,15 +179,22 @@ export function createApp(deps: RouteDeps): Hono {
   });
 
   // Device pairing (public — no device token exists yet)
-  app.post("/api/devices/pair/start", (c) => {
-    const pairing = deps.database.createPairingCode();
+  app.post("/api/devices/pair/start", rateLimitMiddleware(pairStartLimiter), async (c) => {
+    const body = await readJson(c.req.raw);
+    const { codeChallenge } = z.object({
+      codeChallenge: z.string().min(64).max(128)
+    }).parse(body);
+    const pairing = deps.database.createPairingCode(codeChallenge);
     return c.json({ pairingId: pairing.id, code: pairing.code, expiresAt: pairing.expiresAt }, 201);
   });
 
-  app.post("/api/devices/pair/finish", async (c) => {
+  app.post("/api/devices/pair/finish", rateLimitMiddleware(pairFinishLimiter), async (c) => {
     const body = await readJson(c.req.raw);
-    const { code } = z.object({ code: z.string().min(1) }).parse(body);
-    const pairingCode = deps.database.consumePairingCode(code);
+    const { code, codeVerifier } = z.object({
+      code: z.string().min(1),
+      codeVerifier: z.string().min(1)
+    }).parse(body);
+    const pairingCode = deps.database.consumePairingCode(code, codeVerifier);
     if (!pairingCode) {
       return c.json({ error: "invalid_or_expired_code" }, 400);
     }
@@ -211,12 +297,47 @@ export function createApp(deps: RouteDeps): Hono {
   }));
 
   app.post("/api/push/register", auth, async (c) => {
-    const payload = await readJson(c.req.raw);
-    deps.events.publish({ direction: "out", type: "push.registered", payload });
-    return c.json({ ok: true, mode: "recorded-only" }, 202);
+    const deviceId = c.get("deviceId" as never) as string;
+    const body = await readJson(c.req.raw);
+    const { apnsToken, environment } = z.object({
+      apnsToken: z.string().min(1),
+      environment: z.enum(["sandbox", "production"]).default("sandbox")
+    }).parse(body);
+
+    // Persist the token on the device row
+    deps.database.updateDeviceApnsToken(deviceId, apnsToken, environment);
+
+    // Forward to push relay if configured
+    if (deps.pushRelay) {
+      const reg = deps.database.getRelayRegistration();
+      if (reg) {
+        void deps.pushRelay.updateToken(reg.relay_handle, reg.relay_grant, apnsToken);
+      }
+    }
+
+    deps.events.publish({ direction: "out", type: "push.registered", payload: { deviceId, environment } });
+    return c.json({ ok: true, relayConfigured: !!deps.pushRelay }, 202);
   });
 
-  app.post("/api/push/test", auth, (c) => c.json({ ok: true, mode: "not-configured" }, 202));
+  app.post("/api/push/test", auth, async (c) => {
+    const deviceId = c.get("deviceId" as never) as string;
+    if (!deps.pushRelay) {
+      return c.json({ ok: false, reason: "push_relay_not_configured" }, 202);
+    }
+    const reg = deps.database.getRelayRegistration();
+    if (!reg) {
+      return c.json({ ok: false, reason: "bridge_not_registered_with_relay" }, 202);
+    }
+    const device = deps.database.getDeviceById(deviceId);
+    if (!device?.apns_token) {
+      return c.json({ ok: false, reason: "no_apns_token_for_device" }, 202);
+    }
+    const sent = await deps.pushRelay.send(reg.relay_handle, reg.relay_grant, {
+      title: "LobsterPot",
+      body: "Push notifications are working!"
+    });
+    return c.json({ ok: sent }, 202);
+  });
 
   app.get("/api/diagnostics", auth, (c) => c.json({
     service: "lobsterpot-bridge",

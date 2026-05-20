@@ -103,9 +103,13 @@ struct BridgeSSEEvent: Codable {
 
 // MARK: - Persisted connection settings
 
-struct BridgeConnection: Codable, Equatable {
-    var bridgeUrl: String   // e.g. "https://my-bridge.fly.dev"
-    var deviceToken: String // "device_<id>" returned by /api/devices/pair/finish
+struct BridgeConnection: Equatable {
+    var bridgeUrl: String   // e.g. "https://my-bridge.fly.dev"  — stored in UserDefaults
+    var deviceToken: String // "device_<id>" returned by /api/devices/pair/finish — stored in Keychain
 
-    static let storageKey = "bridge_connection_v1"
+    // UserDefaults key for the non-secret bridgeUrl
+    static let urlStorageKey = "bridge_url_v1"
+    // Keychain service + account for the sensitive deviceToken
+    static let keychainService = "com.lobsterpot.app"
+    static let keychainAccount = "deviceToken"
 }

@@ -14,7 +14,18 @@ type DeviceRow = {
   public_key: string | null;
   token_hash: string;
   pairing_code_id: string | null;
+  apns_token: string;
+  apns_environment: string;
   revoked_at: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+type RelayRegistrationRow = {
+  id: string;
+  relay_url: string;
+  relay_handle: string;
+  relay_grant: string;
   created_at: string;
   updated_at: string;
 };
@@ -22,6 +33,7 @@ type DeviceRow = {
 type PairingCodeRow = {
   id: string;
   code: string;
+  code_challenge: string | null;
   used_at: string | null;
   expires_at: string;
   created_at: string;
@@ -246,24 +258,26 @@ export class BridgeDatabase {
 
   // ── Device auth ──────────────────────────────────────────────────────────
 
-  createPairingCode(): PairingStarted {
+  createPairingCode(codeChallenge: string): PairingStarted {
     const id = createId();
     const code = Math.random().toString(36).slice(2, 10).toUpperCase();
     const expiresAt = new Date(Date.now() + 10 * 60_000).toISOString();
     const createdAt = nowIso();
     this.db.prepare(`
-      INSERT INTO pairing_codes (id, code, expires_at, created_at)
-      VALUES (?, ?, ?, ?)
-    `).run(id, code, expiresAt, createdAt);
+      INSERT INTO pairing_codes (id, code, code_challenge, expires_at, created_at)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(id, code, codeChallenge, expiresAt, createdAt);
     return { id, code, expiresAt };
   }
 
-  consumePairingCode(code: string): PairingCodeRow | null {
+  consumePairingCode(code: string, codeVerifier: string): PairingCodeRow | null {
     const row = this.db.prepare(`
       SELECT * FROM pairing_codes
       WHERE code = ? AND used_at IS NULL AND expires_at > ?
     `).get(code, nowIso()) as PairingCodeRow | undefined;
     if (!row) return null;
+    // PKCE: verify SHA-256(codeVerifier) matches the stored challenge
+    if (row.code_challenge && sha256(codeVerifier) !== row.code_challenge) return null;
     this.db.prepare(`UPDATE pairing_codes SET used_at = ? WHERE id = ?`).run(nowIso(), row.id);
     return row;
   }
@@ -287,6 +301,34 @@ export class BridgeDatabase {
 
   revokeDevice(id: string): void {
     this.db.prepare(`UPDATE devices SET revoked_at = ?, updated_at = ? WHERE id = ?`).run(nowIso(), nowIso(), id);
+  }
+
+  // ── Push relay ───────────────────────────────────────────────────────────
+
+  getRelayRegistration(): RelayRegistrationRow | null {
+    return this.db.prepare(`SELECT * FROM relay_registrations LIMIT 1`).get() as RelayRegistrationRow | undefined ?? null;
+  }
+
+  upsertRelayRegistration(input: { url: string; handle: string; grant: string }): void {
+    const now = nowIso();
+    this.db.prepare(`
+      INSERT INTO relay_registrations (id, relay_url, relay_handle, relay_grant, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(relay_handle) DO UPDATE SET
+        relay_url = excluded.relay_url,
+        relay_grant = excluded.relay_grant,
+        updated_at = excluded.updated_at
+    `).run(createId(), input.url, input.handle, input.grant, now, now);
+  }
+
+  updateDeviceApnsToken(deviceId: string, apnsToken: string, environment: "sandbox" | "production"): void {
+    this.db.prepare(`
+      UPDATE devices SET apns_token = ?, apns_environment = ?, updated_at = ? WHERE id = ?
+    `).run(apnsToken, environment, nowIso(), deviceId);
+  }
+
+  getDeviceById(id: string): DeviceRow | null {
+    return this.db.prepare(`SELECT * FROM devices WHERE id = ? AND revoked_at IS NULL`).get(id) as DeviceRow | undefined ?? null;
   }
 
   listEventsAfter(cursor?: string | null, limit = 100): PublicBridgeEvent[] {

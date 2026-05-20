@@ -2,6 +2,7 @@ import { describe, expect, it, beforeEach } from "vitest";
 import { mkdtempSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { createHash, randomBytes } from "node:crypto";
 import { BridgeDatabase } from "../src/db.js";
 import { EventBus } from "../src/eventBus.js";
 import { PluginHub } from "../src/pluginHub.js";
@@ -26,14 +27,26 @@ function testApp(): TestEnv {
   return { app, database };
 }
 
-/** Create a device token via the pairing flow and return the bearer header value */
+/** Generate a PKCE code_verifier + code_challenge pair */
+function pkce(): { codeVerifier: string; codeChallenge: string } {
+  const codeVerifier = randomBytes(32).toString("base64url");
+  const codeChallenge = createHash("sha256").update(codeVerifier).digest("hex");
+  return { codeVerifier, codeChallenge };
+}
+
+/** Create a device token via the PKCE pairing flow and return the bearer header value */
 async function pairDevice(app: Hono): Promise<string> {
-  const start = await app.request("/api/devices/pair/start", { method: "POST" });
+  const { codeVerifier, codeChallenge } = pkce();
+  const start = await app.request("/api/devices/pair/start", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ codeChallenge })
+  });
   const { code } = await start.json() as { pairingId: string; code: string };
   const finish = await app.request("/api/devices/pair/finish", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ code })
+    body: JSON.stringify({ code, codeVerifier })
   });
   const { token } = await finish.json() as { token: string };
   return `Bearer ${token}`;
@@ -75,22 +88,38 @@ describe("setup", () => {
 describe("pairing", () => {
   it("starts a pairing session", async () => {
     const { app } = testApp();
-    const res = await app.request("/api/devices/pair/start", { method: "POST" });
+    const { codeChallenge } = pkce();
+    const res = await app.request("/api/devices/pair/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ codeChallenge })
+    });
     const body = await res.json() as { pairingId: string; code: string; expiresAt: string };
     expect(res.status).toBe(201);
     expect(body.code).toMatch(/^[A-Z0-9]{8}$/);
     expect(body.expiresAt).toBeTruthy();
   });
 
+  it("rejects /pair/start without a codeChallenge", async () => {
+    const { app } = testApp();
+    const res = await app.request("/api/devices/pair/start", { method: "POST" });
+    expect(res.status).toBe(400);
+  });
+
   it("completes pairing and returns a device token", async () => {
     const { app } = testApp();
-    const start = await app.request("/api/devices/pair/start", { method: "POST" });
+    const { codeVerifier, codeChallenge } = pkce();
+    const start = await app.request("/api/devices/pair/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ codeChallenge })
+    });
     const { code } = await start.json() as { code: string };
 
     const finish = await app.request("/api/devices/pair/finish", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ code })
+      body: JSON.stringify({ code, codeVerifier })
     });
     const body = await finish.json() as { token: string; deviceId: string };
     expect(finish.status).toBe(201);
@@ -98,23 +127,48 @@ describe("pairing", () => {
     expect(body.deviceId).toBeTruthy();
   });
 
+  it("rejects a wrong codeVerifier (PKCE check)", async () => {
+    const { app } = testApp();
+    const { codeChallenge } = pkce();
+    const start = await app.request("/api/devices/pair/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ codeChallenge })
+    });
+    const { code } = await start.json() as { code: string };
+
+    const res = await app.request("/api/devices/pair/finish", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ code, codeVerifier: "wrong-verifier" })
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json() as { error: string };
+    expect(body.error).toBe("invalid_or_expired_code");
+  });
+
   it("rejects a replayed pairing code", async () => {
     const { app } = testApp();
-    const start = await app.request("/api/devices/pair/start", { method: "POST" });
+    const { codeVerifier, codeChallenge } = pkce();
+    const start = await app.request("/api/devices/pair/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ codeChallenge })
+    });
     const { code } = await start.json() as { code: string };
 
     // First use — success
     await app.request("/api/devices/pair/finish", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ code })
+      body: JSON.stringify({ code, codeVerifier })
     });
 
     // Second use — should fail
     const replay = await app.request("/api/devices/pair/finish", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ code })
+      body: JSON.stringify({ code, codeVerifier })
     });
     expect(replay.status).toBe(400);
     const body = await replay.json() as { error: string };
@@ -123,10 +177,11 @@ describe("pairing", () => {
 
   it("rejects an invalid pairing code", async () => {
     const { app } = testApp();
+    const { codeVerifier } = pkce();
     const res = await app.request("/api/devices/pair/finish", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ code: "BADCODE1" })
+      body: JSON.stringify({ code: "BADCODE1", codeVerifier })
     });
     expect(res.status).toBe(400);
   });

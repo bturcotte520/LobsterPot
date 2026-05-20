@@ -85,6 +85,27 @@ Declare capabilities in the config to enable optional bridge features:
 
 The plugin uses exponential backoff capped at `maxReconnectDelayMs`. On reconnect it sends the last known `resumeCursor` in the `hello` frame; the bridge uses this to replay any events the plugin missed while disconnected.
 
-## OpenClaw version compatibility
+## Compatibility & versioning
 
-The plugin declares a peer dependency of `openclaw >= 2026.0.0`. The channel plugin API (`openclaw.plugin.json` manifest + channel runtime) was introduced in that release. Confirm the target version with your OpenClaw instance before deploying.
+### Bridge protocol version
+
+The LobsterPot bridge protocol is **versioned independently of OpenClaw**. This is the same decoupling model as the Telegram Bot API: OpenClaw can release updates at any cadence without requiring coordinated updates to the bridge or the iOS app.
+
+The current protocol version is exposed as `LOBSTERPOT_PROTOCOL_VERSION` in `packages/protocol/src/index.ts` and sent in every `hello` / `hello.ok` handshake frame. The bridge can negotiate with multiple protocol versions simultaneously.
+
+**Compatibility contract:**
+
+| Layer | Versioned by | Can update independently |
+|---|---|---|
+| OpenClaw (operator software) | OpenClaw project | Yes |
+| `@lobsterpot/openclaw-channel` plugin | LobsterPot, semver | Yes |
+| Bridge HTTP/SSE API | `LOBSTERPOT_PROTOCOL_VERSION` | Yes |
+| iOS app | App Store / TestFlight | Yes |
+
+If a breaking change is ever needed in the bridge protocol, a new `LOBSTERPOT_PROTOCOL_VERSION` value is introduced and the bridge advertises it in `hello.ok`. Older clients remain supported until explicitly removed.
+
+### OpenClaw version compatibility
+
+The plugin declares a peer dependency of `"openclaw": "*"` in `package.json`. The channel plugin SDK contract (the `openclaw.plugin.json` manifest format and channel runtime interface) is OpenClaw's responsibility to keep stable. LobsterPot pins no specific OpenClaw version; if the SDK API changes in a breaking way, a new version of `@lobsterpot/openclaw-channel` will be released to match.
+
+Confirm the channel plugin SDK API is available in your OpenClaw instance before deploying (introduced in OpenClaw ≥ 2026.0.0).

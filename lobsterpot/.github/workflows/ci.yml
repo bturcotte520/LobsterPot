@@ -50,5 +50,6 @@ jobs:
             -sdk "$MACOS_SDK" \
             -target arm64-apple-macosx13.0 \
             apps/ios/LobsterPot/Models.swift \
+            apps/ios/LobsterPot/KeychainHelper.swift \
             apps/ios/LobsterPot/BridgeClient.swift \
             apps/ios/LobsterPot/AppState.swift

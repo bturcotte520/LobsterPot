@@ -9,6 +9,7 @@ struct SetupView: View {
     @State private var step: Step = .enterUrl
     @State private var pairingCode = ""
     @State private var pairingId = ""
+    @State private var pairingCodeVerifier = ""
     @State private var isWorking = false
     @State private var errorMessage: String?
 
@@ -143,9 +144,10 @@ struct SetupView: View {
         Task {
             defer { isWorking = false }
             do {
-                let resp = try await client.startPairing()
+                let (resp, verifier) = try await client.startPairing()
                 pairingId = resp.pairingId
                 pairingCode = resp.code
+                pairingCodeVerifier = verifier
                 step = .showCode
             } catch {
                 errorMessage = error.localizedDescription
@@ -164,7 +166,7 @@ struct SetupView: View {
         Task {
             defer { isWorking = false }
             do {
-                let resp = try await client.finishPairing(pairingId: pairingId, code: pairingCode)
+                let resp = try await client.finishPairing(pairingId: pairingId, code: pairingCode, codeVerifier: pairingCodeVerifier)
                 let conn = BridgeConnection(bridgeUrl: url, deviceToken: resp.token)
                 step = .done
                 try? await Task.sleep(nanoseconds: 800_000_000)

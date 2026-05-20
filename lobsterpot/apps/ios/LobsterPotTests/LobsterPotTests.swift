@@ -17,11 +17,12 @@ final class LobsterPotTests: XCTestCase {
         XCTAssertNotEqual(a, b)
     }
 
-    func testBridgeConnectionPersistRoundtrip() throws {
-        let conn = BridgeConnection(bridgeUrl: "https://bridge.example.com", deviceToken: "device_abc")
-        let data = try JSONEncoder().encode(conn)
-        let decoded = try JSONDecoder().decode(BridgeConnection.self, from: data)
-        XCTAssertEqual(conn, decoded)
+    func testBridgeConnectionStorageKeys() {
+        // Verify the storage key constants are stable; changing them would break
+        // existing installations that already have data persisted under these keys.
+        XCTAssertEqual(BridgeConnection.urlStorageKey, "bridge_url_v1")
+        XCTAssertEqual(BridgeConnection.keychainService, "com.lobsterpot.app")
+        XCTAssertEqual(BridgeConnection.keychainAccount, "deviceToken")
     }
 
     // MARK: - LPConversation

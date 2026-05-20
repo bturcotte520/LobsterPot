@@ -47,12 +47,22 @@ final class AppState: ObservableObject {
         conversations = []
         messages = [:]
         pendingApprovals = []
-        UserDefaults.standard.removeObject(forKey: BridgeConnection.storageKey)
+        UserDefaults.standard.removeObject(forKey: BridgeConnection.urlStorageKey)
+        KeychainHelper.delete(
+            service: BridgeConnection.keychainService,
+            account: BridgeConnection.keychainAccount
+        )
     }
 
     func loadPersistedConnection() {
-        guard let data = UserDefaults.standard.data(forKey: BridgeConnection.storageKey),
-              let conn = try? JSONDecoder().decode(BridgeConnection.self, from: data) else { return }
+        guard
+            let bridgeUrl = UserDefaults.standard.string(forKey: BridgeConnection.urlStorageKey),
+            let deviceToken = KeychainHelper.load(
+                service: BridgeConnection.keychainService,
+                account: BridgeConnection.keychainAccount
+            )
+        else { return }
+        let conn = BridgeConnection(bridgeUrl: bridgeUrl, deviceToken: deviceToken)
         connection = conn
         startBridgeClient(conn)
     }
@@ -235,9 +245,14 @@ final class AppState: ObservableObject {
     }
 
     private func persist(_ conn: BridgeConnection) {
-        if let data = try? JSONEncoder().encode(conn) {
-            UserDefaults.standard.set(data, forKey: BridgeConnection.storageKey)
-        }
+        // Bridge URL is not secret — store in UserDefaults for easy access
+        UserDefaults.standard.set(conn.bridgeUrl, forKey: BridgeConnection.urlStorageKey)
+        // Device token is a bearer credential — store in Keychain
+        KeychainHelper.save(
+            conn.deviceToken,
+            service: BridgeConnection.keychainService,
+            account: BridgeConnection.keychainAccount
+        )
     }
 
     private func upsertMessage(_ msg: LPMessage) {
