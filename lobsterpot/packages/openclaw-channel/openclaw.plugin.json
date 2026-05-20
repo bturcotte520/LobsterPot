@@ -1,0 +1,57 @@
+{
+  "id": "lobsterpot",
+  "kind": "channel",
+  "channels": ["lobsterpot"],
+  "name": "LobsterPot",
+  "description": "Connect OpenClaw to the LobsterPot iOS app.",
+  "activation": {
+    "onStartup": false,
+    "onChannels": ["lobsterpot"]
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  },
+  "channelConfigs": {
+    "lobsterpot": {
+      "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean", "default": true },
+          "bridgeUrl": { "type": "string", "minLength": 1 },
+          "token": { "type": "string", "minLength": 1 },
+          "dmPolicy": {
+            "type": "string",
+            "enum": ["allowlist", "pairing", "open", "disabled"],
+            "default": "allowlist"
+          },
+          "allowFrom": {
+            "type": "array",
+            "items": { "type": "string" },
+            "default": ["ios:primary"]
+          },
+          "streaming": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "progress": { "type": "boolean", "default": true }
+            }
+          }
+        },
+        "required": ["bridgeUrl", "token"]
+      },
+      "uiHints": {
+        "bridgeUrl": {
+          "label": "Bridge URL",
+          "placeholder": "https://your-lobsterpot.fly.dev"
+        },
+        "token": {
+          "label": "Bridge token",
+          "sensitive": true
+        }
+      }
+    }
+  }
+}

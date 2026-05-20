@@ -1,0 +1,15 @@
+.DS_Store
+node_modules/
+dist/
+coverage/
+.env
+.env.*
+!.env.example
+*.db
+*.db-shm
+*.db-wal
+.swiftpm/
+DerivedData/
+*.xcuserdata/
+apps/bridge/data/
+apps/push-relay/data/

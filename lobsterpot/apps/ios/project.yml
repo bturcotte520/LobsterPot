@@ -1,0 +1,86 @@
+name: LobsterPot
+options:
+  bundleIdPrefix: com.lobsterpot
+  deploymentTarget:
+    iOS: "17.0"
+  xcodeVersion: "15.0"
+  generateEmptyDirectories: true
+  groupSortPosition: top
+
+settings:
+  base:
+    SWIFT_VERSION: "5.10"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    DEVELOPMENT_TEAM: ""               # set via LOBSTERPOT_TEAM_ID env or xcconfig
+    CODE_SIGN_STYLE: Automatic
+    ENABLE_HARDENED_RUNTIME: YES
+    SWIFT_STRICT_CONCURRENCY: complete
+
+configs:
+  Debug: debug
+  Release: release
+
+targets:
+  LobsterPot:
+    type: application
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: LobsterPot
+        type: group
+    info:
+      path: LobsterPot/Info.plist
+      properties:
+        CFBundleDisplayName: LobsterPot
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        UILaunchScreen:
+          UIColorName: ""
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        NSAppTransportSecurity:
+          # Allow plain-HTTP bridges only in Debug so developers can test on localhost;
+          # production builds require HTTPS enforced by the bridge itself.
+          NSAllowsLocalNetworking: true
+        UIRequiresFullScreen: false
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+    entitlements:
+      path: LobsterPot/LobsterPot.entitlements
+      properties:
+        aps-environment: development          # change to production for App Store builds
+        com.apple.security.application-groups: []
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.lobsterpot.app
+      configs:
+        Debug:
+          SWIFT_OPTIMIZATION_LEVEL: "-Onone"
+          SWIFT_ACTIVE_COMPILATION_CONDITIONS: DEBUG
+          DEBUG_INFORMATION_FORMAT: dwarf
+        Release:
+          SWIFT_OPTIMIZATION_LEVEL: "-O"
+          DEBUG_INFORMATION_FORMAT: dwarf-with-dsym
+          VALIDATE_PRODUCT: YES
+
+  LobsterPotTests:
+    type: bundle.unit-test
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: LobsterPotTests
+    dependencies:
+      - target: LobsterPot
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.lobsterpot.app.tests
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/LobsterPot.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/LobsterPot"

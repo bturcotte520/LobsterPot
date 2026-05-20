@@ -1,7 +1,69 @@
 # KiloChat — iOS Subagent Messaging App
 ## End-to-End Build Plan
 
+> **Open source project.** Anyone can clone, deploy their own bridge, and connect their OpenClaw instance.
+> Designed for single-user-per-instance (personal AI assistant), not multi-tenant SaaS.
+
 ---
+
+## Open Source Design
+
+### Multi-user architecture
+Each user runs their own bridge instance. No shared database, no multi-tenancy. This keeps it simple:
+
+- **One bridge = one user = one OpenClaw instance**
+- Each user deploys to their own Fly.io app (free tier covers this)
+- No accounts, no auth server, no shared infrastructure
+- The iOS app is universal — any user can connect to any bridge URL
+
+### What a new user does:
+```
+1. Fork/clone kilochat repo
+2. Run: fly launch (pick a name, get https://yourname.fly.dev)
+3. Open iOS app → paste bridge URL → auto-generates connect token
+4. Add token to their OpenClaw config → done
+```
+Total time: ~5 minutes.
+
+### Repo structure for open source:
+```
+kilochat/
+├── README.md           # Project overview, setup, screenshots
+├── LICENSE             # MIT
+├── backend/            # Bridge service (Node.js)
+│   ├── Dockerfile      # Ready for Fly.io, Docker, any host
+│   ├── fly.toml        # Fly.io deploy config
+│   ├── package.json
+│   └── src/
+├── ios/                # SwiftUI iOS app
+│   ├── KiloChat.xcodeproj/
+│   └── KiloChat/
+├── docs/
+│   ├── setup.md        # Step-by-step setup guide
+│   ├── deploying.md    # Deploy to Fly.io, Render, Railway
+│   └── openclaw-config.md  # How to connect your OpenClaw
+└── .github/
+    └── workflows/
+        ├── backend-ci.yml   # Tests on PR
+        └── deploy.yml       # Auto-deploy to Fly.io on push to main
+```
+
+### What makes it easy to adopt:
+1. **One-click deploy:** `fly.toml` + `Dockerfile` = `fly launch` and go
+2. **No database setup:** SQLite is built-in, zero config
+3. **No accounts:** User's own OpenClaw is the auth boundary
+4. **QR code setup:** iOS app generates QR → user scans into OpenClaw config (or copies JSON)
+5. **Auto-detect:** Bridge URL detected from the app's network, user just confirms
+6. **Docs:** Setup guide covers both the bridge deploy and the OpenClaw connection
+7. **MIT license:** Permissive, no restrictions
+8. **One config line:** User adds 3 lines to their existing OpenClaw config — that's the entire integration
+
+### What to add to the build plan:
+- GitHub Actions CI for backend (run tests on PR)
+- `README.md` with setup screenshots and QR flow
+- `docs/setup.md` — step-by-step for non-technical users
+- `docker-compose.yml` for local development
+- `.env.example` with all configurable values
 
 ## Architecture Overview
 
@@ -137,28 +199,77 @@ CREATE TABLE openclaw_config (
 
 ---
 
-### Phase 2: OpenClaw Integration
+### Phase 2: OpenClaw Integration (Channel Plugin Model)
 
-**What OpenClaw needs to do:**
+**Connection model — like Telegram:**
 
-The bridge service calls OpenClaw's existing APIs:
-- `sessions_send(session_key, message)` — send message to any session
-- `sessions_spawn(task, mode="session")` — create new subagent session
-- `sessions_list()` — list existing sessions
-- `sessions_history(session_key)` — get conversation history (for scrollback)
-
-**Custom OpenClaw channel (optional but recommended):**
-
-Instead of the bridge polling OpenClaw, create a minimal custom channel plugin that:
-1. Receives messages from the bridge
-2. Routes them to the correct session
-3. Pushes responses back to the bridge
-
-This is cleaner than the bridge calling `sessions_send` and waiting for a response. The flow:
+The bridge generates a connection key. The user adds it to OpenClaw config. OpenClaw connects TO the bridge (not the other way around).
 
 ```
-iOS → Bridge → OpenClaw custom channel → correct session → response → channel → Bridge → iOS
+1. iOS app → Bridge generates: { bridge_url, connect_token }
+2. User adds to OpenClaw config:
+   {
+     "channels": {
+       "kilochat": {
+         "enabled": true,
+         "bridgeUrl": "https://kilochat-bridge.fly.dev",
+         "token": "kilochat_abc123..."
+       }
+     }
+   }
+3. OpenClaw gateway POSTs to bridge: /api/openclaw/connect
+   → Bridge stores: { gateway_url, gateway_token, connected = true }
+4. Connection established. Bidirectional communication ready.
 ```
+
+**Why this is better:**
+- User never needs to find or copy OpenClaw gateway tokens
+- Same UX as adding a Telegram bot token
+- Works with ANY OpenClaw instance — just paste the bridge URL + token
+- OpenClaw already knows how to reach out (it does this for Telegram, Discord, etc.)
+
+**How the bridge works as an OpenClaw channel:**
+
+The bridge exposes two webhook endpoints that OpenClaw calls:
+
+1. `POST /api/openclaw/inbound` — OpenClaw sends assistant replies here
+   - Bridge receives: `{ conversation_id, message, session_key }`
+   - Bridge pushes to iOS via SSE
+
+2. `POST /api/openclaw/connect` — OpenClaw registers itself on first connect
+   - Bridge receives: `{ gateway_url, gateway_token }` (sent by OpenClaw)
+   - Bridge stores credentials for outbound calls
+
+**Outbound (iOS → OpenClaw):**
+When the bridge needs to send a user message to OpenClaw, it uses the stored gateway credentials to call:
+- `sessions_send(session_key, message)` — existing OpenClaw API
+- `sessions_spawn(...)` — for new subagent creation
+
+**Connection UI in the iOS app:**
+```
+Settings → "Connect OpenClaw"
+→ Shows: "Add this to your OpenClaw config:"
+→ QR code + copyable JSON:
+  {
+    "channel": "kilochat",
+    "bridgeUrl": "https://yourname.fly.dev",
+    "token": "kilochat_abc123..."
+  }
+→ "Copy" button → copies the JSON
+→ "I've added it" button → Bridge polls /api/openclaw/connect to confirm connection
+→ Shows "Connected ✓" when OpenClaw has reached out
+```
+
+**What the user pastes into their OpenClaw config:**
+```yaml
+# openclaw.yaml or openclaw.json
+channels:
+  kilochat:
+    enabled: true
+    bridgeUrl: "https://yourname.fly.dev"
+    token: "kilochat_abc123..."
+```
+That's it. OpenClaw handles the rest.
 
 ---
 
@@ -215,20 +326,19 @@ Requirements:
    - openclaw_config (key, value)
 
 2. API endpoints:
-   - POST /api/setup — store OpenClaw gateway URL and token
+   - POST /api/openclaw/connect — OpenClaw gateway calls this to register (receives gateway_url + gateway_token)
+   - POST /api/openclaw/inbound — OpenClaw gateway calls this with assistant replies
    - POST /api/conversations — create new subagent (calls OpenClaw sessions_spawn)
    - GET /api/conversations — list all conversations (sorted by updated_at desc)
    - POST /api/messages — send message to a conversation (calls OpenClaw sessions_send)
    - GET /api/messages/:conversation_id — get message history for a conversation
-   - GET /api/stream — SSE endpoint for realtime responses
+   - GET /api/stream — SSE endpoint for realtime responses to iOS
+   - GET /api/status — connection status (for iOS app to check if OpenClaw connected)
 
 3. OpenClaw integration:
-   - Use HTTP calls to the OpenClaw gateway API
-   - sessions_send for sending messages
-   - sessions_spawn for creating subagents
-   - Parse the gateway API responses and relay back to the client
-
-4. Auth: Simple token auth. The iOS app sends a Bearer token matching the one stored in openclaw_config.
+   - The bridge receives gateway credentials from OpenClaw (via /api/openclaw/connect)
+   - Uses those credentials to call sessions_send, sessions_spawn, etc.
+   - Receives assistant replies via webhook from OpenClaw (via /api/openclaw/inbound)
 
 5. Error handling: graceful failures, proper HTTP status codes, no crashes.
 
@@ -289,11 +399,18 @@ Use Swift 5.9+, SwiftUI, Xcode 15+.
 Phase 1: Setup screen + conversation list
 
 1. SetupScreen (shown on first launch):
-   - "Connect to OpenClaw" header
-   - Gateway URL text field
-   - Token text field (secure)
-   - "Connect" button
-   - On success: save to UserDefaults (secure enclave for token), show ConversationList
+   - "Connect your OpenClaw" header
+   - Bridge auto-generates a connect_token on first launch
+   - Shows: QR code + copyable text:
+     ```
+     Bridge URL: https://yourname.fly.dev
+     Token: kilochat_a1b2c3...
+     ```
+   - Text: "Add to your OpenClaw config and restart"
+   - Copy JSON button: `{ "channel": "kilochat", "bridgeUrl": "...", "token": "..." }`
+   - "I've connected it" button → polls /api/status until connected
+   - On connected: show ConversationList
+   - Bridge URL is auto-detected from app's network config
 
 2. ConversationList:
    - NavigationStack
@@ -386,6 +503,24 @@ The bridge service needs to be deployed to Fly.io.
 
 ## Data Flow — Complete Example
 
+### First-time setup:
+```
+1. User deploys bridge (fly launch → https://username.fly.dev)
+2. User opens iOS app → app auto-detects bridge URL
+3. App generates connect_token, shows QR code + JSON:
+   { "channel": "kilochat", "bridgeUrl": "https://username.fly.dev", "token": "kilochat_a1b2c3" }
+4. User adds to OpenClaw config (or pastes into the "Add Channel" flow):
+   channels:
+     kilochat:
+       enabled: true
+       bridgeUrl: https://username.fly.dev
+       token: kilochat_a1b2c3
+5. OpenClaw gateway POSTs to bridge /api/openclaw/connect
+6. Bridge receives gateway_url + gateway_token from OpenClaw → stores in SQLite
+7. App polls /api/status → sees "connected" → shows conversation list
+```
+
+### Normal messaging:
 ```
 1. User opens app → sees conversation list
    Bridge: GET /api/conversations → returns [{id, name, lastMessage, ...}]
@@ -397,14 +532,15 @@ The bridge service needs to be deployed to Fly.io.
    Bridge: POST /api/messages { conversation_id, message }
    → Bridge looks up session_key for this conversation
    → Bridge calls OpenClaw: sessions_send(session_key, message)
-   → OpenClaw's subagent processes, returns reply
-   → Bridge stores message + reply in SQLite
+   → OpenClaw's subagent processes
+   → OpenClaw gateway POSTs reply to bridge /api/openclaw/inbound
+   → Bridge stores reply in SQLite
    → Bridge pushes reply to iOS via SSE
 
 4. User taps "New Conversation"
    → Types name: "Code Reviewer", purpose: "Reviews my PRs for bugs and style"
    Bridge: POST /api/conversations { name, purpose }
-   → Bridge calls OpenClaw: sessions_spawn(task="You are Code Reviewer. Reviews PRs for bugs and style.", mode="session")
+   → Bridge calls OpenClaw: sessions_spawn(task="You are Code Reviewer...", mode="session")
    → OpenClaw returns session_key
    → Bridge stores conversation + session_key mapping
    → Bridge returns new conversation to iOS
@@ -419,7 +555,8 @@ The bridge service needs to be deployed to Fly.io.
 
 ## Key OpenClaw API Calls
 
-All via HTTP to `{gateway_url}/api/`:
+### Outbound (bridge → OpenClaw)
+All via HTTP to `{gateway_url}/api/` (gateway_url received during connection handshake):
 
 ```
 # Create subagent session
@@ -447,6 +584,26 @@ GET /api/sessions
 Headers: Authorization: Bearer {gateway_token}
 ```
 
+### Inbound (OpenClaw → bridge)
+OpenClaw calls these webhooks on the bridge:
+
+```
+# First-time connection handshake
+POST {bridge_url}/api/openclaw/connect
+Body: {
+  "gatewayUrl": "https://...",
+  "gatewayToken": "..."
+}
+
+# Assistant message delivery
+POST {bridge_url}/api/openclaw/inbound
+Body: {
+  "conversation_id": "...",
+  "session_key": "...",
+  "message": "Here's the answer..."
+}
+```
+
 ---
 
 ## Token Cost Analysis
@@ -465,12 +622,14 @@ Headers: Authorization: Bearer {gateway_token}
 ## Order of Operations
 
 1. **Backend first** — Bridge service with SQLite + OpenClaw integration
-2. **Test with curl** — Verify all endpoints work against your OpenClaw instance
-3. **iOS app skeleton** — Xcode project, SwiftUI views, API client
-4. **Connect iOS → Bridge → OpenClaw** — End-to-end message flow
-5. **Polish** — Typing indicators, streaming, push notifications, editing
-6. **Deploy bridge** — Fly.io with persistent SQLite volume
-7. **Ship** — TestFlight for personal use
+2. **Docker + Fly.io config** — Make it deployable in one command
+3. **Test with curl** — Verify all endpoints work against your OpenClaw instance
+4. **README + docs** — Setup guide, screenshots, QR flow
+5. **iOS app skeleton** — Xcode project, SwiftUI views, API client
+6. **Connect iOS → Bridge → OpenClaw** — End-to-end message flow
+7. **Polish** — Typing indicators, streaming, push notifications, editing
+8. **GitHub Actions** — CI/CD for auto-deploy
+9. **Ship** — Open source release + TestFlight for personal use
 
 ---
 
