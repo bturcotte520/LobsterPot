@@ -5,6 +5,9 @@ struct SettingsView: View {
     @State private var showAddWorkspace = false
     @State private var confirmRemove: Workspace?
 
+    // Loaded once — not re-computed on every body render
+    private let identity = DeviceIdentity.loadOrCreate()
+
     var body: some View {
         NavigationStack {
             List {
@@ -19,29 +22,7 @@ struct SettingsView: View {
                     }
                 }
 
-                Section("Device") {
-                    let identity = DeviceIdentity.loadOrCreate()
-                    LabeledContent("Device ID") {
-                        Text(String(identity.id.prefix(16)) + "…")
-                            .font(.system(.caption, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                    }
-                    HStack {
-                        Text("Device ID (full)")
-                            .font(.caption)
-                        Spacer()
-                        Button {
-                            UIPasteboard.general.string = identity.id
-                        } label: {
-                            Label("Copy", systemImage: "doc.on.doc")
-                                .font(.caption)
-                        }
-                    }
-                    Text(identity.id)
-                        .font(.system(.caption2, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                        .textSelection(.enabled)
-                }
+                deviceSection
 
                 Section("About") {
                     LabeledContent("Protocol", value: "OpenClaw Gateway v4")
@@ -62,8 +43,34 @@ struct SettingsView: View {
                 }
                 Button("Cancel", role: .cancel) { confirmRemove = nil }
             } message: { ws in
-                Text("Remove "\(ws.name)"? Your device token for this gateway will be deleted.")
+                Text("Remove \(ws.name)? Your device token for this gateway will be deleted.")
             }
+        }
+    }
+
+    // Extracted so the type-checker doesn't time out on a complex inline Section
+    private var deviceSection: some View {
+        Section("Device") {
+            LabeledContent("Device ID") {
+                Text(String(identity.id.prefix(16)) + "…")
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+            HStack {
+                Text("Copy full Device ID")
+                    .font(.caption)
+                Spacer()
+                Button {
+                    UIPasteboard.general.string = identity.id
+                } label: {
+                    Label("Copy", systemImage: "doc.on.doc")
+                        .font(.caption)
+                }
+            }
+            Text(identity.id)
+                .font(.system(.caption2, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .textSelection(.enabled)
         }
     }
 
