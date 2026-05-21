@@ -5,6 +5,7 @@ struct ContentView: View {
     @State private var showWorkspacePicker = false
     @State private var showAddWorkspace = false
     @State private var selectedSessionKey: String?
+    @State private var showNotConnectedAlert = false
 
     var body: some View {
         NavigationSplitView {
@@ -29,6 +30,11 @@ struct ContentView: View {
         }
         .sheet(isPresented: $showAddWorkspace) {
             SetupView(isAddingWorkspace: true)
+        }
+        .alert("Not Connected", isPresented: $showNotConnectedAlert) {
+            Button("OK", role: .cancel) { }
+        } message: {
+            Text("Connect to a gateway first. Check Settings → Workspaces for the connection status.")
         }
     }
 
@@ -67,6 +73,16 @@ struct ContentView: View {
 
     private var newSessionButton: some View {
         Button {
+            guard case .connected = appState.activeConnectionState else {
+                showNotConnectedAlert = true
+                return
+            }
+            // If a main session already exists, open it directly
+            if let key = appState.mainSessionKey {
+                selectedSessionKey = key
+                return
+            }
+            // Otherwise create a fresh session
             Task {
                 if let session = await appState.createSession() {
                     selectedSessionKey = session.id

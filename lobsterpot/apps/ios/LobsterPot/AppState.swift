@@ -45,7 +45,20 @@ final class AppState: ObservableObject {
 
     var activeSessions: [LPSession] {
         guard let id = activeWorkspaceId else { return [] }
-        return sessions[id] ?? []
+        let list = sessions[id] ?? []
+        // Main agent session always pinned at top, then subagents by recency
+        return list.sorted {
+            if $0.isMain != $1.isMain { return $0.isMain }
+            let a = $0.lastMessageTs ?? .distantPast
+            let b = $1.lastMessageTs ?? .distantPast
+            return a > b
+        }
+    }
+
+    /// The session key for the main agent of the active workspace,
+    /// e.g. "agent:main:main". Falls back to the first listed session.
+    var mainSessionKey: String? {
+        activeSessions.first(where: { $0.isMain })?.id ?? activeSessions.first?.id
     }
 
     var activeConnectionState: GatewayConnectionState {
