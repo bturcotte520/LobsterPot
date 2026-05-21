@@ -179,7 +179,7 @@ final class GatewayClient: NSObject {
                     // Keep the waiting-for-pairing state; short retry
                     try? await Task.sleep(nanoseconds: 5_000_000_000)
                 default:
-                    connectionState = .error(err.localizedDescription ?? "Connection failed")
+                    connectionState = .error(err.localizedDescription)
                     try? await Task.sleep(nanoseconds: reconnectBackoff)
                     reconnectBackoff = min(reconnectBackoff * 2, 30_000_000_000)
                 }
@@ -204,7 +204,7 @@ final class GatewayClient: NSObject {
 
         // Start receive loop
         receiveLoopTask?.cancel()
-        let receiveTask = Task { [weak self] in
+        let receiveTask = Task<Void, Never> { [weak self] in
             await self?.receiveLoop()
         }
         receiveLoopTask = receiveTask
@@ -357,7 +357,7 @@ final class GatewayClient: NSObject {
                     connectContinuation = nil
                 } else if code == "AUTH_TOKEN_MISMATCH",
                           details?.canRetryWithDeviceToken == true,
-                          let token = workspace.loadDeviceToken()
+                          let _ = workspace.loadDeviceToken()
                 {
                     // One-shot retry with device token — handled by retrying attemptConnect
                     cont.resume(throwing: GatewayClientError.connectFailed("AUTH_TOKEN_MISMATCH"))
