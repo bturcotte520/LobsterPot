@@ -452,7 +452,11 @@ final class GatewayClient: NSObject {
         case "https": components.scheme = "wss"
         default: break
         }
-        if components.port == nil { components.port = 18789 }
+        // Only force port 18789 for plain ws:// (local/LAN self-hosted).
+        // wss:// defaults to port 443 — let the OS handle it.
+        if components.port == nil && components.scheme == "ws" {
+            components.port = 18789
+        }
         return components.url
     }
 
