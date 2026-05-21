@@ -242,7 +242,7 @@ final class GatewayClient: NSObject {
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
             // Wait until the task finishes (disconnect, error, etc.)
             Task {
-                receiveTask.value
+                await receiveTask.value
                 cont.resume()
             }
         }
