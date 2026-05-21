@@ -4,6 +4,7 @@ struct ContentView: View {
     @EnvironmentObject private var appState: AppState
     @State private var showWorkspacePicker = false
     @State private var showAddWorkspace = false
+    @State private var showSettings = false
     @State private var selectedSessionKey: String?
     @State private var showNotConnectedAlert = false
 
@@ -14,7 +15,8 @@ struct ContentView: View {
                     ToolbarItem(placement: .navigationBarLeading) {
                         workspaceButton
                     }
-                    ToolbarItem(placement: .navigationBarTrailing) {
+                    ToolbarItemGroup(placement: .navigationBarTrailing) {
+                        settingsButton
                         newSessionButton
                     }
                 }
@@ -31,10 +33,13 @@ struct ContentView: View {
         .sheet(isPresented: $showAddWorkspace) {
             SetupView(isAddingWorkspace: true)
         }
+        .sheet(isPresented: $showSettings) {
+            SettingsView()
+        }
         .alert("Not Connected", isPresented: $showNotConnectedAlert) {
             Button("OK", role: .cancel) { }
         } message: {
-            Text("Connect to a gateway first. Check Settings → Workspaces for the connection status.")
+            Text("Connect to a gateway first. Tap the gear icon to manage workspaces.")
         }
     }
 
@@ -68,6 +73,14 @@ struct ContentView: View {
                 .fill(connected ? .green : .red)
                 .frame(width: 8, height: 8)
                 .offset(x: 2, y: 2)
+        }
+    }
+
+    private var settingsButton: some View {
+        Button {
+            showSettings = true
+        } label: {
+            Image(systemName: "gearshape")
         }
     }
 
