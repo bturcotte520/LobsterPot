@@ -1,115 +1,75 @@
 import Foundation
 
-// MARK: - Core models mirroring @lobsterpot/protocol
+// MARK: - Session (inbox row)
 
-struct LPConversation: Codable, Identifiable, Equatable {
-    let id: String
-    var title: String
-    var purpose: String?
-    let kind: ConversationKind
-    var pinned: Bool
-    var archivedAt: String?
-    let createdAt: String
-    var updatedAt: String
+/// One row in the iMessage-style inbox.
+/// Mirrors `GWSessionRow` but adds UI-computed properties and local state.
+struct LPSession: Identifiable, Equatable {
+    let id: String                  // session key, e.g. "agent:main:main"
+    let workspaceId: UUID
+    var displayName: String
+    var lastMessagePreview: String?
+    var lastMessageTs: Date?
+    var isMain: Bool
+    var isSubagent: Bool
+    var hasUnread: Bool
 
-    enum ConversationKind: String, Codable {
-        case main, specialist, support, system
+    init(row: GWSessionRow, workspaceId: UUID) {
+        self.id = row.key
+        self.workspaceId = workspaceId
+        self.displayName = row.displayName
+        self.lastMessagePreview = row.lastMessage?.text.flatMap {
+            $0.isEmpty ? nil : String($0.prefix(120))
+        }
+        if let ts = row.lastMessage?.ts {
+            self.lastMessageTs = Date(timeIntervalSince1970: TimeInterval(ts) / 1000)
+        }
+        self.isMain = row.isMain
+        self.isSubagent = row.isSubagent
+        self.hasUnread = false
     }
 }
 
-struct LPMessage: Codable, Identifiable, Equatable {
-    let id: String
-    let conversationId: String
-    let role: MessageRole
-    var content: String
-    var status: MessageStatus
-    let sourceEventId: String?
-    let createdAt: String
-    var updatedAt: String
+// MARK: - Chat message
 
-    enum MessageRole: String, Codable {
-        case user, assistant, system, tool
+/// A single message in a chat thread.
+struct LPMessage: Identifiable, Equatable {
+    enum Role: String, Equatable { case user, assistant, system, tool }
+    enum Status: Equatable { case final_, streaming, error }
+
+    let id: String
+    let sessionKey: String
+    var role: Role
+    var text: String
+    var status: Status
+    var timestamp: Date
+
+    init(id: String = UUID().uuidString, sessionKey: String, role: Role,
+         text: String, status: Status = .final_, timestamp: Date = Date()) {
+        self.id = id
+        self.sessionKey = sessionKey
+        self.role = role
+        self.text = text
+        self.status = status
+        self.timestamp = timestamp
     }
 
-    enum MessageStatus: String, Codable {
-        case queued, sending, sent, streaming, final, failed, cancelled
+    init(chatRow: GWChatMessage, sessionKey: String) {
+        self.id = chatRow.id
+        self.sessionKey = sessionKey
+        self.role = Role(rawValue: chatRow.role) ?? .assistant
+        self.text = chatRow.text ?? ""
+        self.status = .final_
+        self.timestamp = chatRow.ts.map { Date(timeIntervalSince1970: TimeInterval($0) / 1000) } ?? Date()
     }
 }
+
+// MARK: - Approval request
 
 struct LPApprovalRequest: Identifiable {
     let id: String
-    let conversationId: String
-    let approvalId: String
+    let sessionKey: String
     let title: String
     let body: String?
-    let expiresAt: String?
-}
-
-// MARK: - Bridge API response envelopes
-
-struct ConversationListResponse: Codable {
-    let conversations: [LPConversation]
-}
-
-struct ConversationResponse: Codable {
-    let conversation: LPConversation
-}
-
-struct MessageListResponse: Codable {
-    let messages: [LPMessage]
-}
-
-struct SendMessageResponse: Codable {
-    let message: LPMessage
-    let eventId: String?
-}
-
-struct BridgeStatusResponse: Codable {
-    let ok: Bool
-    let service: String
-    let plugin: PluginStatus
-    let publicBaseUrl: String?
-    let now: String
-
-    struct PluginStatus: Codable {
-        let connected: Bool
-        let status: String
-        let instanceId: String?
-        let lastSeenAt: String?
-        let capabilities: [String]
-    }
-}
-
-struct TokenResponse: Codable {
-    let id: String
-    let token: String
-    let createdAt: String
-}
-
-struct SnippetResponse: Codable {
-    let json5: String
-    let bridgeUrl: String
-}
-
-// MARK: - SSE event envelope
-
-struct BridgeSSEEvent: Codable {
-    let id: String
-    let cursor: String
-    let type: String
-    let conversationId: String?
-    let createdAt: String
-}
-
-// MARK: - Persisted connection settings
-
-struct BridgeConnection: Equatable {
-    var bridgeUrl: String   // e.g. "https://my-bridge.fly.dev"  — stored in UserDefaults
-    var deviceToken: String // "device_<id>" returned by /api/devices/pair/finish — stored in Keychain
-
-    // UserDefaults key for the non-secret bridgeUrl
-    static let urlStorageKey = "bridge_url_v1"
-    // Keychain service + account for the sensitive deviceToken
-    static let keychainService = "com.lobsterpot.app"
-    static let keychainAccount = "deviceToken"
+    let expiresAt: Date?
 }

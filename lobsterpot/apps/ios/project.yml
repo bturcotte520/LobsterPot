@@ -29,6 +29,9 @@ targets:
     sources:
       - path: LobsterPot
         type: group
+        excludes:
+          - "Info.plist"
+          - "LobsterPot.entitlements"
     info:
       path: LobsterPot/Info.plist
       properties:

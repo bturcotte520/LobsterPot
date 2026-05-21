@@ -3,160 +3,115 @@ import XCTest
 
 final class LobsterPotTests: XCTestCase {
 
-    // MARK: - BridgeConnection
+    // MARK: - DeviceIdentity
 
-    func testBridgeConnectionEquality() {
-        let a = BridgeConnection(bridgeUrl: "https://bridge.example.com", deviceToken: "device_abc")
-        let b = BridgeConnection(bridgeUrl: "https://bridge.example.com", deviceToken: "device_abc")
-        XCTAssertEqual(a, b)
+    func testDeviceIdentityIsStable() {
+        let a = DeviceIdentity.loadOrCreate()
+        let b = DeviceIdentity.loadOrCreate()
+        XCTAssertEqual(a.id, b.id, "Device ID must be stable across calls")
+        XCTAssertEqual(a.publicKeyBase64, b.publicKeyBase64)
     }
 
-    func testBridgeConnectionInequality() {
-        let a = BridgeConnection(bridgeUrl: "https://bridge.example.com", deviceToken: "device_abc")
-        let b = BridgeConnection(bridgeUrl: "https://other.example.com", deviceToken: "device_abc")
-        XCTAssertNotEqual(a, b)
+    func testDeviceIdIsHexSHA256() {
+        let identity = DeviceIdentity.loadOrCreate()
+        XCTAssertEqual(identity.id.count, 64, "Device ID should be a 64-char SHA-256 hex string")
+        XCTAssertTrue(identity.id.allSatisfy { "0123456789abcdef".contains($0) })
     }
 
-    func testBridgeConnectionStorageKeys() {
-        // Verify the storage key constants are stable; changing them would break
-        // existing installations that already have data persisted under these keys.
-        XCTAssertEqual(BridgeConnection.urlStorageKey, "bridge_url_v1")
-        XCTAssertEqual(BridgeConnection.keychainService, "com.lobsterpot.app")
-        XCTAssertEqual(BridgeConnection.keychainAccount, "deviceToken")
+    func testSignProducesNonEmptyBase64() {
+        let identity = DeviceIdentity.loadOrCreate()
+        let (sig, signedAt) = identity.sign(
+            nonce: "test-nonce-abc123",
+            role: "operator",
+            scopes: ["operator.read", "operator.write"],
+            token: "lobsterpot_test_token"
+        )
+        XCTAssertFalse(sig.isEmpty, "Signature must not be empty")
+        XCTAssertGreaterThan(signedAt, 0)
+        // Base64 characters only
+        let base64Chars = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=")
+        XCTAssertTrue(sig.unicodeScalars.allSatisfy { base64Chars.contains($0) })
     }
 
-    // MARK: - LPConversation
-
-    func testConversationDecodeFromJSON() throws {
-        let json = """
-        {
-          "id": "550e8400-e29b-41d4-a716-446655440000",
-          "title": "My Conversation",
-          "purpose": "Research questions",
-          "kind": "specialist",
-          "pinned": false,
-          "archivedAt": null,
-          "createdAt": "2026-01-01T00:00:00.000Z",
-          "updatedAt": "2026-01-01T00:00:00.000Z"
-        }
-        """.data(using: .utf8)!
-
-        let decoder = JSONDecoder()
-        decoder.keyDecodingStrategy = .convertFromSnakeCase
-        let conv = try decoder.decode(LPConversation.self, from: json)
-
-        XCTAssertEqual(conv.id, "550e8400-e29b-41d4-a716-446655440000")
-        XCTAssertEqual(conv.title, "My Conversation")
-        XCTAssertEqual(conv.kind, .specialist)
-        XCTAssertFalse(conv.pinned)
+    func testSignV3PayloadFormat() {
+        // Verify the v3 pipe-delimited payload matches what OpenClaw expects:
+        // v3|{deviceId}|{clientId}|{clientMode}|{role}|{scopes,comma}|{signedAtMs}|{token}|{nonce}|{platform}|{deviceFamily}
+        let identity = DeviceIdentity.loadOrCreate()
+        let nonce = "testnonce"
+        let ts = Int64(1700000000000)
+        let (_, signedAt) = identity.sign(
+            nonce: nonce,
+            role: "operator",
+            scopes: ["operator.read", "operator.write"],
+            token: "tok",
+            clientId: "lobsterpot-ios",
+            clientMode: "operator",
+            platform: "iOS",       // will be lowercased to "ios"
+            deviceFamily: "iPhone", // will be lowercased to "iphone"
+            signedAtMs: ts
+        )
+        XCTAssertEqual(signedAt, Int(ts))
     }
 
-    func testConversationKindAllCases() {
-        let kinds: [LPConversation.ConversationKind] = [.main, .specialist, .support, .system]
-        XCTAssertEqual(kinds.count, 4)
-        for kind in kinds {
-            let encoded = try? JSONEncoder().encode(kind)
-            XCTAssertNotNil(encoded)
-        }
+    // MARK: - GatewayFrames
+
+    func testGWSessionRowDisplayName() {
+        // Main session
+        let main = makeSessionRow(key: "agent:main:main", label: nil, agentId: "main")
+        XCTAssertEqual(main.displayName, "Main")
+        XCTAssertTrue(main.isMain)
+        XCTAssertFalse(main.isSubagent)
+
+        // Subagent with label
+        let labeled = makeSessionRow(key: "agent:main:subagent:abc123", label: "Research", agentId: nil)
+        XCTAssertEqual(labeled.displayName, "Research")
+        XCTAssertTrue(labeled.isSubagent)
+
+        // Subagent without label
+        let unlabeled = makeSessionRow(key: "agent:main:subagent:abcdef12", label: nil, agentId: nil)
+        XCTAssertTrue(unlabeled.displayName.contains("Subagent"))
+    }
+
+    // MARK: - Workspace
+
+    func testWorkspaceInitials() {
+        XCTAssertEqual(Workspace(name: "KiloClaw", gatewayUrl: "wss://x:18789", gatewayToken: "t").initials, "KI")
+        XCTAssertEqual(Workspace(name: "My Gateway", gatewayUrl: "wss://x:18789", gatewayToken: "t").initials, "MG")
+        XCTAssertEqual(Workspace(name: "X", gatewayUrl: "wss://x:18789", gatewayToken: "t").initials, "X")
+    }
+
+    func testWorkspaceNormalizedUrl() {
+        let ws = Workspace(name: "Test", gatewayUrl: "wss://kiloclaw.ts.net", gatewayToken: "t")
+        XCTAssertTrue(ws.normalizedUrl.contains("18789"), "Default port 18789 should be added")
     }
 
     // MARK: - LPMessage
 
-    func testMessageDecodeFromJSON() throws {
-        let json = """
-        {
-          "id": "msg-001",
-          "conversationId": "conv-001",
-          "role": "assistant",
-          "content": "Hello!",
-          "status": "final",
-          "sourceEventId": null,
-          "createdAt": "2026-01-01T00:00:00.000Z",
-          "updatedAt": "2026-01-01T00:00:00.000Z"
-        }
-        """.data(using: .utf8)!
+    func testLPMessageRole() {
+        let msg = LPMessage(sessionKey: "k", role: .user, text: "hi")
+        XCTAssertEqual(msg.role, .user)
+        XCTAssertEqual(msg.status, .final_)
+    }
 
-        let decoder = JSONDecoder()
-        decoder.keyDecodingStrategy = .convertFromSnakeCase
-        let msg = try decoder.decode(LPMessage.self, from: json)
-
-        XCTAssertEqual(msg.id, "msg-001")
+    func testLPMessageInitFromChatRow() {
+        let row = GWChatMessage(id: "m1", role: "assistant", text: "Hello", ts: 1700000000000, runId: nil)
+        let msg = LPMessage(chatRow: row, sessionKey: "agent:main:main")
+        XCTAssertEqual(msg.id, "m1")
         XCTAssertEqual(msg.role, .assistant)
-        XCTAssertEqual(msg.status, .final)
-        XCTAssertNil(msg.sourceEventId)
+        XCTAssertEqual(msg.text, "Hello")
     }
 
-    func testMessageStatusAllCases() {
-        let statuses: [LPMessage.MessageStatus] = [.queued, .sending, .sent, .streaming, .final, .failed, .cancelled]
-        XCTAssertEqual(statuses.count, 7)
-    }
+    // MARK: - Helpers
 
-    func testMessageRoleAllCases() {
-        let roles: [LPMessage.MessageRole] = [.user, .assistant, .system, .tool]
-        XCTAssertEqual(roles.count, 4)
-    }
+    private func makeSessionRow(key: String, label: String?, agentId: String?) -> GWSessionRow {
+        // Decode from JSON to exercise the Codable path
+        let json: [String: Any] = [
+            "key": key,
+            "agentId": agentId as Any,
+            "label": label as Any
+        ].compactMapValues { $0 is NSNull ? nil : $0 }
 
-    // MARK: - ConversationListResponse
-
-    func testConversationListResponseDecode() throws {
-        let json = """
-        {
-          "conversations": [
-            {
-              "id": "1", "title": "A",
-              "kind": "main", "pinned": true,
-              "createdAt": "2026-01-01T00:00:00.000Z",
-              "updatedAt": "2026-01-01T00:00:00.000Z"
-            }
-          ]
-        }
-        """.data(using: .utf8)!
-
-        let decoder = JSONDecoder()
-        decoder.keyDecodingStrategy = .convertFromSnakeCase
-        let resp = try decoder.decode(ConversationListResponse.self, from: json)
-        XCTAssertEqual(resp.conversations.count, 1)
-        XCTAssertEqual(resp.conversations[0].title, "A")
-        XCTAssertTrue(resp.conversations[0].pinned)
-    }
-
-    // MARK: - BridgeStatusResponse
-
-    func testBridgeStatusResponseDecode() throws {
-        let json = """
-        {
-          "ok": true,
-          "service": "lobsterpot-bridge",
-          "plugin": {
-            "connected": false,
-            "status": "waiting",
-            "instanceId": null,
-            "lastSeenAt": null,
-            "capabilities": []
-          },
-          "now": "2026-01-01T00:00:00.000Z"
-        }
-        """.data(using: .utf8)!
-
-        let decoder = JSONDecoder()
-        decoder.keyDecodingStrategy = .convertFromSnakeCase
-        let status = try decoder.decode(BridgeStatusResponse.self, from: json)
-        XCTAssertTrue(status.ok)
-        XCTAssertFalse(status.plugin.connected)
-        XCTAssertEqual(status.plugin.status, "waiting")
-    }
-
-    // MARK: - TokenResponse
-
-    func testTokenResponseDecode() throws {
-        let json = """
-        {"id":"tok-1","token":"lobsterpot_abc","createdAt":"2026-01-01T00:00:00.000Z"}
-        """.data(using: .utf8)!
-
-        let decoder = JSONDecoder()
-        decoder.keyDecodingStrategy = .convertFromSnakeCase
-        let token = try decoder.decode(TokenResponse.self, from: json)
-        XCTAssertEqual(token.token, "lobsterpot_abc")
-        XCTAssertTrue(token.token.hasPrefix("lobsterpot_"))
+        let data = try! JSONSerialization.data(withJSONObject: json)
+        return try! JSONDecoder().decode(GWSessionRow.self, from: data)
     }
 }

@@ -9,8 +9,8 @@ struct LobsterPotApp: App {
         WindowGroup {
             RootView()
                 .environmentObject(appState)
-                .onAppear {
-                    appState.loadPersistedConnection()
+                .task {
+                    appState.connectAllWorkspaces()
                 }
         }
     }
@@ -20,7 +20,7 @@ private struct RootView: View {
     @EnvironmentObject private var appState: AppState
 
     var body: some View {
-        if appState.connection == nil {
+        if appState.workspaceStore.workspaces.isEmpty {
             SetupView()
         } else {
             ContentView()

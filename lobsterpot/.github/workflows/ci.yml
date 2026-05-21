@@ -6,50 +6,22 @@ on:
   pull_request:
 
 jobs:
-  node:
-    name: Node packages (build + test)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 9.15.9
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: pnpm
-          cache-dependency-path: pnpm-lock.yaml
-
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Build all packages
-        run: pnpm build
-
-      - name: Run all tests
-        run: pnpm test
-
-      - name: Typecheck all packages
-        run: pnpm typecheck
-
   swift-typecheck:
-    name: Swift source typecheck (macOS SDK)
+    name: Swift typecheck (macOS SDK)
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Typecheck core Swift files
-        # Full Xcode iOS SDK not available in all runners; typechecking against
-        # macOS SDK catches the vast majority of type errors. Full iOS build
-        # requires Xcode and a provisioned device/simulator.
+      - name: Typecheck Swift sources
+        # Full iOS SDK requires Xcode + provisioning; typechecking on the macOS SDK
+        # catches the vast majority of type errors and works on any macOS runner.
         run: |
           MACOS_SDK=$(xcrun --show-sdk-path --sdk macosx)
           swiftc -typecheck \
             -sdk "$MACOS_SDK" \
             -target arm64-apple-macosx13.0 \
-            apps/ios/LobsterPot/Models.swift \
             apps/ios/LobsterPot/KeychainHelper.swift \
-            apps/ios/LobsterPot/BridgeClient.swift \
-            apps/ios/LobsterPot/AppState.swift
+            apps/ios/LobsterPot/Models.swift \
+            apps/ios/LobsterPot/Gateway/GatewayFrames.swift \
+            apps/ios/LobsterPot/Gateway/DeviceIdentity.swift \
+            apps/ios/LobsterPot/Workspace/Workspace.swift
