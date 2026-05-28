@@ -31,6 +31,7 @@ struct ContentView: View {
         } detail: {
             if let id = selectedConversationId {
                 ChatView(conversationId: id)
+                    .id(id)
             } else {
                 emptyDetail
             }
@@ -73,6 +74,14 @@ struct ContentView: View {
                         .shadow(radius: 10, y: 4)
                     }
                     .buttonStyle(.plain)
+                    .simultaneousGesture(
+                        DragGesture(minimumDistance: 12)
+                            .onEnded { value in
+                                if value.translation.height < -24 {
+                                    appState.newSubagentConversation = nil
+                                }
+                            }
+                    )
                     .transition(.move(edge: .top).combined(with: .opacity))
                 }
 

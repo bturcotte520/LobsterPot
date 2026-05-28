@@ -15,7 +15,6 @@ import {
   registerSessionBindingAdapter,
   unregisterSessionBindingAdapter
 } from "openclaw/plugin-sdk/conversation-runtime";
-import { callGatewayFromCli } from "openclaw/plugin-sdk/gateway-runtime";
 import { createId } from "@lobsterpot/shared";
 import type { InboundMessage } from "@lobsterpot/protocol";
 import { LobsterPotBridgeClient } from "./bridge-client.js";
@@ -35,17 +34,10 @@ type ActiveRuntime = {
 
 let activeRuntime: ActiveRuntime | null = null;
 
-type PendingSubagentThread = {
-  parentConversationId: string;
-  childConversationId: string;
-  label: string;
-  purpose: string | null;
-};
+const materializedConversationIdsBySession = new Map<string, string>();
 
-const pendingSubagentThreadsByParent = new Map<string, PendingSubagentThread>();
-
-// Labels of specialist threads we have already materialized from main-agent announcements
-// in this runtime lifetime (best-effort dedup across autonomous spawns).
+// Session keys and labels of real OpenClaw subagent threads already materialized
+// in this runtime lifetime.
 const materializedSpecialistLabels = new Set<string>();
 
 export function startLobsterPotRuntime(api: OpenClawPluginApi): ActiveRuntime | null {
@@ -121,22 +113,27 @@ export async function materializeOpenClawSubagentSession(input: {
   runId?: string;
   mode?: "run" | "session";
   requesterConversationId?: string | null;
-}): Promise<void> {
-  if (!activeRuntime) return;
+}): Promise<string | null> {
+  if (!activeRuntime) return null;
   const sessionKey = input.childSessionKey.trim();
-  if (!sessionKey || materializedSpecialistLabels.has(sessionKey)) return;
+  if (!sessionKey) return null;
+
+  const existingConversationId = materializedConversationIdsBySession.get(sessionKey);
+  if (existingConversationId) return existingConversationId;
 
   const title = input.label?.trim() || `Subagent ${sessionKey.split(":").pop()?.slice(0, 8) ?? ""}`.trim();
-  const created = await activeRuntime.client.createConversation({
+  const conversationId = (await activeRuntime.client.createConversation({
     title,
     kind: "subagent",
     openclawSessionKey: sessionKey,
     openclawAgentId: input.agentId
-  });
+  })).id;
+
   materializedSpecialistLabels.add(sessionKey);
   materializedSpecialistLabels.add(title.toLowerCase());
+  materializedConversationIdsBySession.set(sessionKey, conversationId);
   activeRuntime.adapter.bindExistingConversation({
-    conversationId: created.id,
+    conversationId,
     targetSessionKey: sessionKey,
     targetKind: "subagent",
     parentConversationId: input.requesterConversationId ?? null,
@@ -148,10 +145,11 @@ export async function materializeOpenClawSubagentSession(input: {
     }
   });
   activeRuntime.client.sendTextReply(
-    created.id,
+    conversationId,
     `${title} is connected to OpenClaw session ${sessionKey}.`,
     "final"
   );
+  return conversationId;
 }
 
 /**
@@ -163,11 +161,6 @@ export function sendOutboundText(conversationId: string, text: string, status: "
   if (!activeRuntime) return null;
   const ok = activeRuntime.client.sendTextReply(conversationId, text, status);
   if (!ok) return null;
-
-  // Best-effort: if the main agent just announced a new specialist (e.g. after
-  // an autonomous subagent spawn), materialize a real LobsterPot thread for it
-  // so the iOS client sees a new conversation row with the intro.
-  void maybeMaterializeSpecialistFromAnnouncement(text);
 
   return { messageId: createId() };
 }
@@ -207,37 +200,11 @@ async function handleInboundMessage(
       conversationId,
       targetSessionKey: metadata.openclawSessionKey,
       targetKind: "subagent",
+      parentConversationId: null,
       metadata: {
         label: metadata.conversationTitle,
         agentId: metadata.openclawAgentId
       }
-    });
-    await dispatchOpenClawSessionTurn({
-      cfg: cfg as Record<string, unknown>,
-      conversationId,
-      sessionKey: metadata.openclawSessionKey,
-      text,
-      idempotencyKey: event.id,
-      logger: api.logger
-    });
-    return;
-  }
-
-  const spawnedThread = await maybeCreatePendingSubagentThread({
-    parentConversationId: conversationId,
-    prompt: text,
-    purposeFallback: metadata.conversationPurpose ?? null,
-    logger: api.logger
-  });
-
-  if (spawnedThread) {
-    void dispatchSyntheticSpecialistIntroduction(api, {
-      conversationId: spawnedThread.childConversationId,
-      label: spawnedThread.label,
-      purpose: spawnedThread.purpose,
-      accountId,
-      senderAddress,
-      recipientAddress
     });
   }
 
@@ -268,13 +235,6 @@ async function handleInboundMessage(
       const replyText = payload.text ?? "";
       if (!replyText && !payload.mediaUrls?.length) return;
 
-      const pending = pendingSubagentThreadsByParent.get(conversationId);
-      const extracted = pending ? extractSubagentAnnounceText(replyText, pending.label) : null;
-      if (pending && extracted) {
-        sendOutboundText(pending.childConversationId, extracted, "final");
-        pendingSubagentThreadsByParent.delete(conversationId);
-      }
-
       // Inbound-turn replies always go back to the originating conversation.
       sendOutboundText(conversationId, replyText, "final");
     },
@@ -287,145 +247,6 @@ async function handleInboundMessage(
   });
 }
 
-async function dispatchOpenClawSessionTurn(params: {
-  cfg: Record<string, unknown>;
-  conversationId: string;
-  sessionKey: string;
-  text: string;
-  idempotencyKey: string;
-  logger: { error: (msg: string) => void };
-}): Promise<void> {
-  try {
-    const response = await callGatewayFromCli("agent", {
-      json: true,
-      expectFinal: true,
-      timeout: "150000"
-    }, {
-        message: params.text,
-        sessionKey: params.sessionKey,
-        deliver: false,
-        channel: CHANNEL_ID,
-        to: params.conversationId,
-        idempotencyKey: params.idempotencyKey
-      });
-    const reply = extractGatewayReplyText(response);
-    if (reply) {
-      sendOutboundText(params.conversationId, reply, "final");
-    }
-  } catch (err) {
-    params.logger.error(`[lobsterpot] session-backed send failed: ${String(err)}`);
-    sendOutboundText(
-      params.conversationId,
-      `Unable to send to OpenClaw subagent session ${params.sessionKey}: ${err instanceof Error ? err.message : String(err)}`,
-      "final"
-    );
-  }
-}
-
-function extractGatewayReplyText(response: Record<string, unknown>): string | null {
-  const result = response["result"] as Record<string, unknown> | undefined;
-  const payloads = result?.["payloads"];
-  if (!Array.isArray(payloads)) return null;
-  const texts = payloads
-    .map((payload) => {
-      if (!payload || typeof payload !== "object") return "";
-      const text = (payload as Record<string, unknown>)["text"];
-      return typeof text === "string" ? text : "";
-    })
-    .filter((text) => text.trim().length > 0);
-  return texts.length > 0 ? texts.join("\n\n") : null;
-}
-
-
-async function maybeCreatePendingSubagentThread(params: {
-  parentConversationId: string;
-  prompt: string;
-  purposeFallback?: string | null;
-  logger: { info: (msg: string) => void; warn: (msg: string) => void; error: (msg: string) => void };
-}): Promise<PendingSubagentThread | null> {
-  const label = extractRequestedSubagentLabel(params.prompt);
-  if (!label || !isSubagentThreadRequest(params.prompt)) {
-    return null;
-  }
-  if (!activeRuntime) return null;
-
-  try {
-    const purpose = extractSubagentPurpose(params.prompt) ?? params.purposeFallback ?? null;
-    const created = await activeRuntime.client.createConversation({
-      title: label,
-      purpose,
-      kind: "subagent"
-    });
-    activeRuntime.client.sendTextReply(
-      created.id,
-      buildSpecialistWelcomeText(label, purpose),
-      "final"
-    );
-    const pending: PendingSubagentThread = {
-      parentConversationId: params.parentConversationId,
-      childConversationId: created.id,
-      label,
-      purpose
-    };
-    pendingSubagentThreadsByParent.set(params.parentConversationId, pending);
-    params.logger.info(`[lobsterpot] prepared fallback subagent thread "${label}" -> ${created.id}`);
-    return pending;
-  } catch (err) {
-    params.logger.warn(`[lobsterpot] failed to prepare fallback subagent thread: ${String(err)}`);
-    return null;
-  }
-}
-
-/**
- * When we see an outbound message that looks like the main agent announcing
- * a freshly spawned specialist (e.g. "Chinese Tutor is ready! Here's its intro..."),
- * we create the corresponding specialist bridge conversation (if we haven't
- * already) and inject the intro body. This makes autonomous subagent spawns
- * visible as real persistent threads in the iOS app.
- */
-async function maybeMaterializeSpecialistFromAnnouncement(text: string): Promise<void> {
-  if (!activeRuntime) return;
-
-  const ann = extractSpecialistAnnouncement(text);
-  if (!ann) return;
-
-  const { label, body } = ann;
-  if (materializedSpecialistLabels.has(label.toLowerCase())) return;
-
-  try {
-    const created = await activeRuntime.client.createConversation({
-      title: label,
-      kind: "subagent"
-    });
-    materializedSpecialistLabels.add(label.toLowerCase());
-
-    // Post the captured intro body as the first message in the new thread.
-    activeRuntime.client.sendTextReply(created.id, body, "final");
-
-    // Also drop a short welcome if the body was very short.
-    if (body.length < 20) {
-      activeRuntime.client.sendTextReply(
-        created.id,
-        buildSpecialistWelcomeText(label, null),
-        "final"
-      );
-    }
-
-    // Fire a synthetic inbound so the main agent (if it later addresses the child)
-    // gets the specialist context prompt on the first real user turn.
-    // (We don't have the original sender here, so we skip the full synthetic dispatch.)
-
-    // (Logging is handled by the bridge client / gateway; no direct logger on the client instance.)
-  } catch (err) {
-    // Non-fatal; the announcement is still in the main thread.
-  }
-}
-
-function buildSpecialistWelcomeText(label: string, purpose: string | null): string {
-  const purposeText = purpose ? ` My role: ${purpose}` : "";
-  return `${label} is ready.${purposeText}`;
-}
-
 export function extractRequestedSubagentLabel(prompt: string): string | null {
   const quoted = /label\s+it\s+["“]([^"”]+)["”]/i.exec(prompt);
   if (quoted?.[1]?.trim()) return quoted[1].trim();
@@ -433,7 +254,9 @@ export function extractRequestedSubagentLabel(prompt: string): string | null {
   if (named?.[1]?.trim()) return named[1].trim();
   const forTopic = /(?:subagent|agent|specialist|tutor)\s+for\s+([A-Za-z][^\n.?!,]{2,80})/i.exec(prompt);
   if (forTopic?.[1]?.trim()) return labelFromTopic(forTopic[1]);
-  const createTutor = /(?:create|make|start|open|set\s+up|spin\s+up)\s+(?:a|an|the)?\s*([A-Za-z][^\n.?!,]{2,60}?)\s+(?:subagent|agent|specialist|tutor)\b/i.exec(prompt);
+  const toHelp = /(?:create|make|start|open|set\s+up|spin\s+up)\s+(?:(?:a|an|the)\s+)?(?:new\s+)?(?:subagent|agent|specialist|tutor)\s+to\s+([^\n.?!]{3,100})/i.exec(prompt);
+  if (toHelp?.[1]?.trim()) return labelFromTopic(toHelp[1]);
+  const createTutor = /(?:create|make|start|open|set\s+up|spin\s+up)\s+(?:(?:a|an|the)\s+)?([A-Za-z][^\n.?!,]{2,60}?)\s+(?:subagent|agent|specialist|tutor)\b/i.exec(prompt);
   if (createTutor?.[1]?.trim()) return labelFromTopic(createTutor[1]);
   return null;
 }
@@ -444,8 +267,12 @@ function isSubagentThreadRequest(prompt: string): boolean {
 }
 
 function labelFromTopic(topic: string): string {
+  if (/\b(fitness|get\s+in\s+shape|work\s*out|exercise|strength|running|nutrition)\b/i.test(topic)) {
+    return "Fitness Coach";
+  }
   const cleaned = topic
     .replace(/\b(help(?:ing)?\s+me\s+)?(?:learn|practice|study)\b/gi, "")
+    .replace(/\bhelp(?:ing)?\s+(?:me|us)\b/gi, "")
     .replace(/\b(?:beginner|intermediate|advanced|basic)\b/gi, "")
     .replace(/\b(?:tutoring|practice|lessons?|help)\b/gi, "")
     .replace(/\b(?:with|about|on|for|me|my)\b/gi, "")
@@ -535,54 +362,4 @@ export function buildBodyForAgent(params: {
     ``,
     `User message: ${params.text}`
   ].join("\n");
-}
-
-async function dispatchSyntheticSpecialistIntroduction(
-  api: OpenClawPluginApi,
-  params: {
-    conversationId: string;
-    label: string;
-    purpose: string | null;
-    accountId: string;
-    senderAddress: string;
-    recipientAddress: string;
-  }
-): Promise<void> {
-  const introPrompt = `Introduce yourself as ${params.label}. ${params.purpose ?? "Tell the user what you can help with."}`;
-  await dispatchInboundDirectDmWithRuntime({
-    cfg: api.config as Parameters<typeof dispatchInboundDirectDmWithRuntime>[0]["cfg"],
-    runtime: api.runtime,
-    channel: CHANNEL_ID,
-    channelLabel: CHANNEL_LABEL,
-    accountId: params.accountId,
-    peer: { kind: "direct", id: params.conversationId },
-    senderId: params.senderAddress,
-    senderAddress: params.senderAddress,
-    recipientAddress: params.recipientAddress,
-    conversationLabel: params.label,
-    rawBody: introPrompt,
-    messageId: createId(),
-    bodyForAgent: buildBodyForAgent({
-      text: introPrompt,
-      title: params.label,
-      purpose: params.purpose,
-      kind: "specialist"
-    }),
-    extraContext: {
-      lobsterpotConversationId: params.conversationId,
-      lobsterpotConversationKind: "specialist",
-      lobsterpotSyntheticIntro: true
-    },
-    deliver: async (payload) => {
-      const replyText = payload.text ?? "";
-      if (!replyText && !payload.mediaUrls?.length) return;
-      sendOutboundText(params.conversationId, replyText, "final");
-    },
-    onRecordError: (err) => {
-      api.logger.error(`[lobsterpot] synthetic specialist record error: ${String(err)}`);
-    },
-    onDispatchError: (err, info) => {
-      api.logger.error(`[lobsterpot] synthetic specialist dispatch error (${info.kind}): ${String(err)}`);
-    }
-  });
 }

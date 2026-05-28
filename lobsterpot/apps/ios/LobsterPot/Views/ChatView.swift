@@ -20,6 +20,10 @@ struct ChatView: View {
         messages.last?.id
     }
 
+    private var scrollTargetId: String? {
+        isTyping ? "typing-indicator" : "message-list-bottom"
+    }
+
     private var isTyping: Bool {
         appState.isTyping(conversationId: conversationId)
     }
@@ -80,6 +84,9 @@ struct ChatView: View {
                         TypingIndicator()
                             .id("typing-indicator")
                     }
+                    Color.clear
+                        .frame(height: 1)
+                        .id("message-list-bottom")
                 }
                 .padding(.horizontal, 12)
                 .padding(.top, 8)
@@ -106,6 +113,11 @@ struct ChatView: View {
                     scrollToBottom(proxy, animated: true)
                 }
             }
+            .onChange(of: appState.loadingMessageConversation) { _, loadingConversation in
+                if loadingConversation != conversationId {
+                    performInitialScrollIfNeeded(proxy)
+                }
+            }
         }
     }
 
@@ -113,16 +125,15 @@ struct ChatView: View {
         guard !didPerformInitialScroll, lastMessageId != nil else { return }
         didPerformInitialScroll = true
         DispatchQueue.main.async {
-            scrollToBottom(proxy, animated: false)
             DispatchQueue.main.async {
+                scrollToBottom(proxy, animated: false)
                 didRevealInitialPosition = true
             }
         }
     }
 
     private func scrollToBottom(_ proxy: ScrollViewProxy, animated: Bool) {
-        let target = isTyping ? "typing-indicator" : lastMessageId
-        guard let target else { return }
+        guard let target = scrollTargetId else { return }
         let scroll = { proxy.scrollTo(target, anchor: .bottom) }
         if animated {
             withAnimation(.easeOut(duration: 0.25), scroll)

@@ -31,28 +31,50 @@ const entry: ReturnType<typeof defineChannelPluginEntry<ChannelPlugin<LobsterPot
 
   registerFull(api) {
     const runtime = startLobsterPotRuntime(api);
-    api.registerHook?.("subagent_spawned", async (event: unknown) => {
-      const spawned = event as {
-        childSessionKey?: string;
-        agentId?: string;
-        label?: string;
-        runId?: string;
-        mode?: "run" | "session";
-        requester?: { channel?: string; to?: string | number };
-      };
-      if (!spawned.childSessionKey || !spawned.agentId) return;
+
+    type SubagentEvent = {
+      childSessionKey?: string;
+      agentId?: string;
+      label?: string;
+      runId?: string;
+      mode?: "run" | "session";
+      requester?: { channel?: string; accountId?: string; to?: string | number; threadId?: string | number };
+    };
+
+    const prepareSubagentThread = async (event: SubagentEvent): Promise<string | null> => {
+      if (!event.childSessionKey || !event.agentId) return null;
       const requesterConversationId =
-        spawned.requester?.channel === "lobsterpot" && typeof spawned.requester.to === "string"
-          ? spawned.requester.to
+        event.requester?.channel === "lobsterpot" && typeof event.requester.to === "string"
+          ? event.requester.to
           : null;
-      await materializeOpenClawSubagentSession({
-        childSessionKey: spawned.childSessionKey,
-        agentId: spawned.agentId,
-        label: spawned.label,
-        runId: spawned.runId,
-        mode: spawned.mode,
+      return await materializeOpenClawSubagentSession({
+        childSessionKey: event.childSessionKey,
+        agentId: event.agentId,
+        label: event.label,
+        runId: event.runId,
+        mode: event.mode,
         requesterConversationId
       });
+    };
+
+    api.on("subagent_spawning", async (event) => {
+      const conversationId = await prepareSubagentThread(event as SubagentEvent);
+      if (!conversationId) {
+        return { status: "error", error: "Unable to create LobsterPot subagent thread." };
+      }
+      return {
+        status: "ok",
+        threadBindingReady: true,
+        deliveryOrigin: {
+          channel: "lobsterpot",
+          accountId: (event as SubagentEvent).requester?.accountId,
+          to: conversationId
+        }
+      };
+    });
+
+    api.on("subagent_spawned", async (event) => {
+      await prepareSubagentThread(event as SubagentEvent);
     });
     void runtime;
   }

@@ -13,6 +13,7 @@ describe("runtime specialist helpers", () => {
     expect(extractRequestedSubagentLabel('Spawn a subagent named "Research Lead".')).toBe("Research Lead");
     expect(extractRequestedSubagentLabel("Create a subagent for German tutoring.")).toBe("German Tutor");
     expect(extractRequestedSubagentLabel("Set up a Spanish tutor to help me practice.")).toBe("Spanish Tutor");
+    expect(extractRequestedSubagentLabel("Create a new subagent to help me get in shape.")).toBe("Fitness Coach");
   });
 
   it("extracts subagent purpose from spawn prompts", () => {
