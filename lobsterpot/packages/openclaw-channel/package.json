@@ -1,0 +1,49 @@
+{
+  "name": "@lobsterpot/openclaw-channel",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./setup-entry": {
+      "types": "./dist/setup-entry.d.ts",
+      "default": "./dist/setup-entry.js"
+    }
+  },
+  "openclaw": {
+    "extensions": [
+      "./dist/index.js"
+    ],
+    "setupEntry": "./dist/setup-entry.js",
+    "channel": {
+      "id": "lobsterpot",
+      "label": "LobsterPot",
+      "blurb": "Connect OpenClaw to the LobsterPot iOS app."
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "bundle": "tsc -p tsconfig.json && node build.mjs"
+  },
+  "dependencies": {
+    "@lobsterpot/protocol": "workspace:*",
+    "@lobsterpot/shared": "workspace:*",
+    "ws": "^8.18.2",
+    "zod": "^3.25.28"
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.5.0"
+  },
+  "peerDependenciesMeta": {
+    "openclaw": {
+      "optional": true
+    }
+  }
+}

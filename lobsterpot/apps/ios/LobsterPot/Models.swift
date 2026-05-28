@@ -1,75 +1,176 @@
 import Foundation
 
-// MARK: - Session (inbox row)
+// MARK: - Core models mirroring @lobsterpot/protocol
 
-/// One row in the iMessage-style inbox.
-/// Mirrors `GWSessionRow` but adds UI-computed properties and local state.
-struct LPSession: Identifiable, Equatable {
-    let id: String                  // session key, e.g. "agent:main:main"
-    let workspaceId: UUID
-    var displayName: String
-    var lastMessagePreview: String?
-    var lastMessageTs: Date?
-    var isMain: Bool
-    var isSubagent: Bool
-    var hasUnread: Bool
-
-    init(row: GWSessionRow, workspaceId: UUID) {
-        self.id = row.key
-        self.workspaceId = workspaceId
-        self.displayName = row.displayName
-        self.lastMessagePreview = row.lastMessage?.text.flatMap {
-            $0.isEmpty ? nil : String($0.prefix(120))
-        }
-        if let ts = row.lastMessage?.ts {
-            self.lastMessageTs = Date(timeIntervalSince1970: TimeInterval(ts) / 1000)
-        }
-        self.isMain = row.isMain
-        self.isSubagent = row.isSubagent
-        self.hasUnread = false
-    }
-}
-
-// MARK: - Chat message
-
-/// A single message in a chat thread.
-struct LPMessage: Identifiable, Equatable {
-    enum Role: String, Equatable { case user, assistant, system, tool }
-    enum Status: Equatable { case final_, streaming, error }
-
+struct LPConversation: Codable, Identifiable, Equatable {
     let id: String
-    let sessionKey: String
-    var role: Role
-    var text: String
-    var status: Status
-    var timestamp: Date
+    var title: String
+    var purpose: String?
+    let kind: ConversationKind
+    let openclawSessionKey: String?
+    let openclawAgentId: String?
+    var pinned: Bool
+    var archivedAt: String?
+    let createdAt: String
+    var updatedAt: String
 
-    init(id: String = UUID().uuidString, sessionKey: String, role: Role,
-         text: String, status: Status = .final_, timestamp: Date = Date()) {
-        self.id = id
-        self.sessionKey = sessionKey
-        self.role = role
-        self.text = text
-        self.status = status
-        self.timestamp = timestamp
+    var displayTitle: String {
+        kind == .main ? "Main Agent" : title
     }
 
-    init(chatRow: GWChatMessage, sessionKey: String) {
-        self.id = chatRow.id
-        self.sessionKey = sessionKey
-        self.role = Role(rawValue: chatRow.role) ?? .assistant
-        self.text = chatRow.text ?? ""
-        self.status = .final_
-        self.timestamp = chatRow.ts.map { Date(timeIntervalSince1970: TimeInterval($0) / 1000) } ?? Date()
+    enum ConversationKind: String, Codable {
+        case main, subagent, specialist, support, system
     }
 }
 
-// MARK: - Approval request
+struct LPMessage: Codable, Identifiable, Equatable {
+    let id: String
+    let conversationId: String
+    let role: MessageRole
+    var content: String
+    var status: MessageStatus
+    var attachments: [LPAttachment]
+    let sourceEventId: String?
+    let createdAt: String
+    var updatedAt: String
+
+    enum MessageRole: String, Codable {
+        case user, assistant, system, tool
+    }
+
+    enum MessageStatus: String, Codable {
+        case queued, sending, sent, streaming, final, failed, cancelled
+    }
+
+    var timestamp: Date {
+        ISO8601DateFormatter().date(from: createdAt) ?? Date()
+    }
+}
+
+struct LPAttachment: Codable, Identifiable, Equatable {
+    let id: String
+    let filename: String
+    let contentType: String
+    let byteSize: Int
+    let url: String?
+    let createdAt: String
+}
+
+struct PendingAttachment: Identifiable, Equatable {
+    let id = UUID()
+    let filename: String
+    let contentType: String
+    let data: Data
+}
 
 struct LPApprovalRequest: Identifiable {
     let id: String
-    let sessionKey: String
+    let conversationId: String
+    let approvalId: String
     let title: String
     let body: String?
-    let expiresAt: Date?
+    let expiresAt: String?
+}
+
+// MARK: - Bridge connection settings
+
+struct BridgeConnection: Equatable {
+    /// e.g. "https://my-bridge.fly.dev" — stored in UserDefaults (not secret)
+    var bridgeUrl: String
+    /// "device_<token>" returned by /api/devices/pair/finish — stored in Keychain
+    var deviceToken: String
+
+    static let urlStorageKey = "bridge_url_v1"
+    static let keychainService = "com.lobsterpot.app"
+    static let keychainAccount = "deviceToken"
+}
+
+// MARK: - Bridge API response envelopes
+
+struct ConversationListResponse: Codable {
+    let conversations: [LPConversation]
+}
+
+struct SearchResponse: Codable {
+    let conversations: [LPConversation]
+    let messages: [LPMessage]
+}
+
+struct ConversationResponse: Codable {
+    let conversation: LPConversation
+}
+
+struct MessageListResponse: Codable {
+    let messages: [LPMessage]
+}
+
+struct AttachmentResponse: Codable {
+    let attachment: LPAttachment
+}
+
+struct SendMessageResponse: Codable {
+    let message: LPMessage
+    let eventId: String?
+}
+
+struct BridgeStatusResponse: Codable {
+    let ok: Bool
+    let service: String
+    let plugin: PluginStatus
+    let publicBaseUrl: String?
+    let now: String
+
+    struct PluginStatus: Codable {
+        let connected: Bool
+        let status: String
+        let instanceId: String?
+        let lastSeenAt: String?
+        let capabilities: [String]
+    }
+}
+
+struct PushRegistrationResponse: Codable {
+    let ok: Bool
+    let relayConfigured: Bool
+}
+
+struct TokenResponse: Codable {
+    let id: String
+    let token: String
+    let createdAt: String
+}
+
+struct SnippetResponse: Codable {
+    let json5: String
+    let bridgeUrl: String
+}
+
+struct PairingStartResponse: Codable {
+    let pairingId: String
+    let code: String
+    let expiresAt: String
+}
+
+struct PairingFinishResponse: Codable {
+    let deviceId: String
+    let token: String
+    let createdAt: String
+}
+
+struct EmptyResponse: Codable {}
+
+enum AppearanceMode: String, CaseIterable, Identifiable {
+    case system
+    case light
+    case dark
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .system: return "System"
+        case .light: return "Light"
+        case .dark: return "Dark"
+        }
+    }
 }

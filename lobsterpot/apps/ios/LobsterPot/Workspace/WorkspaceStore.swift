@@ -1,23 +1,14 @@
 import Foundation
 
-/// Persists and manages the list of paired Gateway workspaces.
-///
-/// Storage strategy:
-/// - `[Workspace]` (minus tokens) → UserDefaults under `"workspaces_v1"`
-/// - Gateway token → Keychain under `"gw-token-{id}"`
-/// - Device token → Keychain under `"workspace-{id}"` (set by `GatewayClient`)
+/// Persistent store for workspaces. List metadata in UserDefaults, tokens in Keychain.
 @MainActor
 final class WorkspaceStore: ObservableObject {
 
-    // MARK: - Published state
-
     @Published private(set) var workspaces: [Workspace] = []
+    @Published private(set) var activeWorkspaceId: UUID?
 
-    // MARK: - Keys
-
-    static let listKey = "workspaces_v1"
-
-    // MARK: - Init
+    private static let listStorageKey = "workspace_list_v1"
+    private static let keychainService = "com.lobsterpot.app"
 
     init() {
         load()
@@ -25,65 +16,64 @@ final class WorkspaceStore: ObservableObject {
 
     // MARK: - CRUD
 
-    func add(_ workspace: Workspace) {
-        saveGatewayToken(workspace.gatewayToken, for: workspace.id)
-        var ws = workspace
-        ws.gatewayToken = ""   // don't persist token in UserDefaults
-        workspaces.append(ws)
+    func add(_ workspace: Workspace, deviceToken: String) {
+        workspaces.append(workspace)
+        if activeWorkspaceId == nil { activeWorkspaceId = workspace.id }
+        KeychainHelper.save(deviceToken, service: Self.keychainService, account: workspace.keychainAccount)
+        persist()
+    }
+
+    func remove(_ id: UUID) {
+        if let ws = workspaces.first(where: { $0.id == id }) {
+            KeychainHelper.delete(service: Self.keychainService, account: ws.keychainAccount)
+        }
+        workspaces.removeAll { $0.id == id }
+        if activeWorkspaceId == id {
+            activeWorkspaceId = workspaces.first?.id
+        }
+        persist()
+    }
+
+    func setActive(_ id: UUID) {
+        guard workspaces.contains(where: { $0.id == id }) else { return }
+        activeWorkspaceId = id
         persist()
     }
 
     func update(_ workspace: Workspace) {
-        guard let idx = workspaces.firstIndex(where: { $0.id == workspace.id }) else { return }
-        if !workspace.gatewayToken.isEmpty {
-            saveGatewayToken(workspace.gatewayToken, for: workspace.id)
+        if let idx = workspaces.firstIndex(where: { $0.id == workspace.id }) {
+            workspaces[idx] = workspace
+            persist()
         }
-        var ws = workspace
-        ws.gatewayToken = ""
-        workspaces[idx] = ws
-        persist()
     }
 
-    func remove(_ workspace: Workspace) {
-        workspaces.removeAll { $0.id == workspace.id }
-        deleteGatewayToken(for: workspace.id)
-        KeychainHelper.delete(service: "com.lobsterpot.app", account: "workspace-\(workspace.id)")
-        persist()
+    var activeWorkspace: Workspace? {
+        guard let id = activeWorkspaceId else { return nil }
+        return workspaces.first { $0.id == id }
     }
 
-    /// Returns the workspace with its gateway token hydrated from Keychain.
-    func hydrated(_ workspace: Workspace) -> Workspace {
-        var ws = workspace
-        ws.gatewayToken = loadGatewayToken(for: workspace.id) ?? ""
-        return ws
+    func deviceToken(for workspaceId: UUID) -> String? {
+        guard let ws = workspaces.first(where: { $0.id == workspaceId }) else { return nil }
+        return KeychainHelper.load(service: Self.keychainService, account: ws.keychainAccount)
     }
 
     // MARK: - Persistence
 
     private func load() {
-        guard let data = UserDefaults.standard.data(forKey: Self.listKey),
-              let list = try? JSONDecoder().decode([Workspace].self, from: data)
-        else { return }
-        workspaces = list
+        guard let data = UserDefaults.standard.data(forKey: Self.listStorageKey),
+              let decoded = try? JSONDecoder().decode(WorkspaceList.self, from: data) else {
+            workspaces = []
+            activeWorkspaceId = nil
+            return
+        }
+        workspaces = decoded.workspaces
+        activeWorkspaceId = decoded.activeWorkspaceId ?? decoded.workspaces.first?.id
     }
 
     private func persist() {
-        guard let data = try? JSONEncoder().encode(workspaces) else { return }
-        UserDefaults.standard.set(data, forKey: Self.listKey)
-    }
-
-    // MARK: - Keychain token helpers
-
-    private func saveGatewayToken(_ token: String, for id: UUID) {
-        guard !token.isEmpty else { return }
-        KeychainHelper.save(token, service: "com.lobsterpot.app", account: "gw-token-\(id)")
-    }
-
-    private func loadGatewayToken(for id: UUID) -> String? {
-        KeychainHelper.load(service: "com.lobsterpot.app", account: "gw-token-\(id)")
-    }
-
-    private func deleteGatewayToken(for id: UUID) {
-        KeychainHelper.delete(service: "com.lobsterpot.app", account: "gw-token-\(id)")
+        let list = WorkspaceList(workspaces: workspaces, activeWorkspaceId: activeWorkspaceId)
+        if let data = try? JSONEncoder().encode(list) {
+            UserDefaults.standard.set(data, forKey: Self.listStorageKey)
+        }
     }
 }

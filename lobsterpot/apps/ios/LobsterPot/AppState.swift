@@ -1,260 +1,667 @@
 import Foundation
 import Combine
+import UIKit
+import UserNotifications
 
 @MainActor
 final class AppState: ObservableObject {
 
-    // MARK: - Workspace management
+    // MARK: - Workspace store
+    let workspaceStore = WorkspaceStore()
 
-    @Published var workspaceStore = WorkspaceStore()
-    @Published var activeWorkspaceId: UUID?
+    // MARK: - Per-workspace state
+    /// Active BridgeClient for the active workspace. nil during setup.
+    @Published private(set) var bridgeClient: BridgeClient?
 
-    // MARK: - Sessions (inbox rows), keyed by workspaceId
+    /// Connection state (SSE) per workspace.
+    @Published var isConnected = false
+    @Published var pluginConnected = false
 
-    @Published var sessions: [UUID: [LPSession]] = [:]
-
-    // MARK: - Messages, keyed by sessionKey
-
+    // MARK: - Conversations / messages (active workspace only)
+    @Published var conversations: [LPConversation] = []
+    @Published var archivedConversations: [LPConversation] = []
+    @Published var selectedConversationId: String?
     @Published var messages: [String: [LPMessage]] = [:]
+    @Published var mutedConversationIds: Set<String> = []
+    @Published var searchResults: SearchResponse?
 
-    // MARK: - Connection states, keyed by workspaceId
+    // MARK: - Loading state
+    @Published var isLoadingConversations = false
+    @Published var sendingInConversation: String?
+    @Published var loadingMessageConversation: String?
+    @Published var newSubagentConversation: LPConversation?
+    @Published var recentlyArchivedConversation: LPConversation?
+    @Published private var typingConversationIds: Set<String> = []
+    private var conversationCreatedNotificationCutoff = Date()
+    private var pendingApnsToken: String?
+    private var surfacedCreatedConversationIds: Set<String> = []
 
-    @Published var connectionStates: [UUID: GatewayConnectionState] = [:]
-
-    // MARK: - Loading states
-
-    @Published var isLoadingSessions = false
-    @Published var loadingMessageSession: String?
-    @Published var sendingInSession: String?
+    // MARK: - Pending approvals
+    @Published var pendingApprovals: [LPApprovalRequest] = []
 
     // MARK: - Error banner
-
     @Published var lastError: String?
-
-    // MARK: - Private
-
-    private let identity = DeviceIdentity.loadOrCreate()
-    private var clients: [UUID: GatewayClient] = [:]
-
-    // MARK: - Active workspace helpers
-
-    var activeWorkspace: Workspace? {
-        guard let id = activeWorkspaceId else { return nil }
-        return workspaceStore.workspaces.first { $0.id == id }
-    }
-
-    var activeSessions: [LPSession] {
-        guard let id = activeWorkspaceId else { return [] }
-        let list = sessions[id] ?? []
-        // Main agent session always pinned at top, then subagents by recency
-        return list.sorted {
-            if $0.isMain != $1.isMain { return $0.isMain }
-            let a = $0.lastMessageTs ?? .distantPast
-            let b = $1.lastMessageTs ?? .distantPast
-            return a > b
+    @Published var appearanceMode: AppearanceMode {
+        didSet {
+            UserDefaults.standard.set(appearanceMode.rawValue, forKey: Self.appearanceModeKey)
         }
     }
 
-    /// The session key for the main agent of the active workspace,
-    /// e.g. "agent:main:main". Falls back to the first listed session.
-    var mainSessionKey: String? {
-        activeSessions.first(where: { $0.isMain })?.id ?? activeSessions.first?.id
+    // MARK: - Setup state convenience
+    var isSetupComplete: Bool { !workspaceStore.workspaces.isEmpty }
+    var activeWorkspace: Workspace? { workspaceStore.activeWorkspace }
+    var activeWorkspaceId: UUID? { workspaceStore.activeWorkspaceId }
+
+    private static let appearanceModeKey = "appearance_mode_v1"
+
+    init() {
+        let raw = UserDefaults.standard.string(forKey: Self.appearanceModeKey)
+        appearanceMode = AppearanceMode(rawValue: raw ?? "system") ?? .system
     }
 
-    var activeConnectionState: GatewayConnectionState {
-        guard let id = activeWorkspaceId else { return .disconnected }
-        return connectionStates[id] ?? .disconnected
-    }
+    // MARK: - Lifecycle
 
-    // MARK: - Workspace lifecycle
-
-    func addWorkspace(_ workspace: Workspace) {
-        workspaceStore.add(workspace)
-        connectWorkspace(workspace)
-        if activeWorkspaceId == nil {
-            activeWorkspaceId = workspace.id
+    /// Connect using an active workspace (called on launch + when switching workspaces).
+    func connectToActiveWorkspace() {
+        guard let ws = workspaceStore.activeWorkspace,
+              let token = workspaceStore.deviceToken(for: ws.id) else {
+            // No active workspace — disconnect any existing client
+            tearDownClient()
+            return
         }
+        startClient(bridgeUrl: ws.bridgeUrl, deviceToken: token)
     }
 
-    func removeWorkspace(_ workspace: Workspace) {
-        clients[workspace.id]?.stop()
-        clients.removeValue(forKey: workspace.id)
-        sessions.removeValue(forKey: workspace.id)
-        connectionStates.removeValue(forKey: workspace.id)
-        workspaceStore.remove(workspace)
-        if activeWorkspaceId == workspace.id {
-            activeWorkspaceId = workspaceStore.workspaces.first?.id
-        }
+    /// Add a new workspace and immediately switch to it.
+    func addWorkspace(name: String, bridgeUrl: String, deviceToken: String) {
+        let colorIdx = workspaceStore.workspaces.count
+        let workspace = Workspace(name: name, bridgeUrl: bridgeUrl, colorIndex: colorIdx)
+        workspaceStore.add(workspace, deviceToken: deviceToken)
+        workspaceStore.setActive(workspace.id)
+        connectToActiveWorkspace()
     }
 
+    /// Switch to a different existing workspace.
     func switchWorkspace(to id: UUID) {
-        activeWorkspaceId = id
+        guard id != workspaceStore.activeWorkspaceId else { return }
+        workspaceStore.setActive(id)
+        connectToActiveWorkspace()
     }
 
-    /// Call on app launch to reconnect all previously paired workspaces.
-    func connectAllWorkspaces() {
-        for ws in workspaceStore.workspaces {
-            if clients[ws.id] == nil {
-                connectWorkspace(ws)
-            }
-        }
-        if activeWorkspaceId == nil {
-            activeWorkspaceId = workspaceStore.workspaces.first?.id
+    /// Remove a workspace. If it was active, switches to the next one (or no workspace).
+    func removeWorkspace(_ id: UUID) {
+        let wasActive = workspaceStore.activeWorkspaceId == id
+        workspaceStore.remove(id)
+        if wasActive {
+            connectToActiveWorkspace()
         }
     }
 
-    private func connectWorkspace(_ workspace: Workspace) {
-        let hydrated = workspaceStore.hydrated(workspace)
-        let client = GatewayClient(workspace: hydrated, identity: identity)
+    // MARK: - Private: client lifecycle
 
-        client.onStateChange = { [weak self] state in
-            Task { @MainActor [weak self] in
-                self?.connectionStates[workspace.id] = state
-            }
+    private func startClient(bridgeUrl: String, deviceToken: String) {
+        tearDownClient()
+        conversationCreatedNotificationCutoff = Date()
+        loadSurfacedCreatedConversationIds()
+        let conn = BridgeConnection(bridgeUrl: bridgeUrl, deviceToken: deviceToken)
+        let client = BridgeClient(connection: conn)
+        bridgeClient = client
+
+        client.onEvent = { [weak self] type, payload in
+            Task { @MainActor in self?.handleSSEEvent(type: type, payload: payload) }
+        }
+        client.onConnectionChange = { [weak self] connected in
+            Task { @MainActor in self?.isConnected = connected }
         }
 
-        client.onSessionsChanged = { [weak self] in
-            Task { @MainActor [weak self] in
-                await self?.refreshSessions(for: workspace.id)
-            }
+        Task {
+            await refreshConversations()
+            await checkStatus()
+            await registerPendingPushTokenIfNeeded()
         }
-
-        client.onSessionMessage = { [weak self] payload in
-            Task { @MainActor [weak self] in
-                self?.handleSessionMessage(payload)
-            }
-        }
-
-        clients[workspace.id] = client
-        client.start()
+        client.startEventStream()
     }
 
-    // MARK: - Session operations
+    private func tearDownClient() {
+        bridgeClient?.stop()
+        bridgeClient = nil
+        isConnected = false
+        pluginConnected = false
+        conversations = []
+        messages = [:]
+        archivedConversations = []
+        mutedConversationIds = []
+        searchResults = nil
+        pendingApprovals = []
+        recentlyArchivedConversation = nil
+        typingConversationIds = []
+        selectedConversationId = nil
+    }
 
-    func refreshSessions(for workspaceId: UUID) async {
-        guard let client = clients[workspaceId] else { return }
-        isLoadingSessions = true
-        defer { isLoadingSessions = false }
+    // MARK: - Conversation operations
+
+    func refreshConversations() async {
+        guard let client = bridgeClient else { return }
+        isLoadingConversations = true
+        defer { isLoadingConversations = false }
         do {
-            let rows = try await client.listSessions()
-            let lpSessions = rows.map { LPSession(row: $0, workspaceId: workspaceId) }
-            sessions[workspaceId] = lpSessions
+            let resp = try await client.getConversations()
+            conversations = sortConversations(resp.conversations)
+            loadMutedConversationIds()
+            seedSurfacedCreatedConversationIds(from: resp.conversations)
         } catch {
             lastError = error.localizedDescription
         }
     }
 
-    func createSession(label: String? = nil) async -> LPSession? {
-        guard let id = activeWorkspaceId, let client = clients[id] else { return nil }
+    func refreshArchivedConversations() async {
+        guard let client = bridgeClient else { return }
         do {
-            guard let row = try await client.createSession(label: label) else { return nil }
-            let session = LPSession(row: row, workspaceId: id)
-            if sessions[id] != nil {
-                sessions[id]!.insert(session, at: 0)
-            } else {
-                sessions[id] = [session]
-            }
-            return session
+            let resp = try await client.getConversations(archived: true)
+            archivedConversations = sortConversations(resp.conversations)
+        } catch {
+            lastError = error.localizedDescription
+        }
+    }
+
+    func search(_ query: String) async {
+        guard let client = bridgeClient else { return }
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            searchResults = nil
+            return
+        }
+        do {
+            searchResults = try await client.search(query: trimmed)
+        } catch {
+            lastError = error.localizedDescription
+        }
+    }
+
+    func createConversation(
+        title: String,
+        purpose: String? = nil,
+        kind: LPConversation.ConversationKind = .specialist
+    ) async -> LPConversation? {
+        guard let client = bridgeClient else { return nil }
+        do {
+            let resp = try await client.createConversation(title: title, purpose: purpose, kind: kind.rawValue)
+            conversations.insert(resp.conversation, at: 0)
+            return resp.conversation
         } catch {
             lastError = error.localizedDescription
             return nil
         }
     }
 
+    func pinConversation(_ id: String, pinned: Bool) async {
+        guard let client = bridgeClient else { return }
+        do {
+            let resp = try await client.patchConversation(id: id, pinned: pinned)
+            applyConversationUpdate(resp.conversation)
+        } catch {
+            lastError = error.localizedDescription
+        }
+    }
+
+    func archiveConversation(_ id: String) async {
+        guard let client = bridgeClient else { return }
+        do {
+            let archived = conversations.first { $0.id == id }
+            _ = try await client.patchConversation(id: id, archived: true)
+            conversations.removeAll { $0.id == id }
+            recentlyArchivedConversation = archived
+            scheduleArchiveUndoDismissal(for: id)
+            if selectedConversationId == id { selectedConversationId = nil }
+            await refreshArchivedConversations()
+        } catch {
+            lastError = error.localizedDescription
+        }
+    }
+
+    func unarchiveConversation(_ id: String) async {
+        guard let client = bridgeClient else { return }
+        do {
+            let resp = try await client.patchConversation(id: id, archived: false)
+            archivedConversations.removeAll { $0.id == id }
+            if recentlyArchivedConversation?.id == id {
+                recentlyArchivedConversation = nil
+            }
+            applyConversationUpdateOrInsert(resp.conversation)
+        } catch {
+            lastError = error.localizedDescription
+        }
+    }
+
+    func deleteConversation(_ id: String) async {
+        guard let client = bridgeClient else { return }
+        do {
+            try await client.deleteConversation(id: id)
+            conversations.removeAll { $0.id == id }
+            archivedConversations.removeAll { $0.id == id }
+            messages.removeValue(forKey: id)
+            mutedConversationIds.remove(id)
+            if recentlyArchivedConversation?.id == id {
+                recentlyArchivedConversation = nil
+            }
+            saveMutedConversationIds()
+            if selectedConversationId == id { selectedConversationId = nil }
+        } catch {
+            lastError = error.localizedDescription
+        }
+    }
+
+    func setMuted(_ muted: Bool, conversationId: String) {
+        if muted {
+            mutedConversationIds.insert(conversationId)
+        } else {
+            mutedConversationIds.remove(conversationId)
+        }
+        saveMutedConversationIds()
+    }
+
+    func isMuted(_ conversationId: String) -> Bool {
+        mutedConversationIds.contains(conversationId)
+    }
+
+    // MARK: - Push notifications
+
+    func requestPushNotifications() async {
+        do {
+            let granted = try await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .badge, .sound])
+            guard granted else { return }
+            await MainActor.run {
+                UIApplication.shared.registerForRemoteNotifications()
+            }
+        } catch {
+            lastError = error.localizedDescription
+        }
+    }
+
+    func handleRemoteNotificationToken(_ token: String) {
+        pendingApnsToken = token
+        Task { await registerPendingPushTokenIfNeeded() }
+    }
+
     // MARK: - Message operations
 
-    func loadMessages(sessionKey: String) async {
-        guard let id = activeWorkspaceId, let client = clients[id] else { return }
-        loadingMessageSession = sessionKey
-        defer { loadingMessageSession = nil }
+    func loadMessages(conversationId: String) async {
+        guard let client = bridgeClient else { return }
+        loadingMessageConversation = conversationId
+        defer { loadingMessageConversation = nil }
         do {
-            let rows = try await client.loadHistory(sessionKey: sessionKey)
-            messages[sessionKey] = rows.map { LPMessage(chatRow: $0, sessionKey: sessionKey) }
-            try await client.subscribeMessages(sessionKey: sessionKey)
+            let resp = try await client.getMessages(conversationId: conversationId)
+            messages[conversationId] = resp.messages
         } catch {
             lastError = error.localizedDescription
         }
     }
 
-    func unloadMessages(sessionKey: String) async {
-        guard let id = activeWorkspaceId, let client = clients[id] else { return }
-        try? await client.unsubscribeMessages(sessionKey: sessionKey)
+    func unloadMessages(conversationId: String) async {
+        messages.removeValue(forKey: conversationId)
     }
 
-    func sendMessage(sessionKey: String, text: String) async {
-        guard let id = activeWorkspaceId, let client = clients[id] else { return }
-
-        // Optimistic: show user message immediately
-        let userMsg = LPMessage(
-            sessionKey: sessionKey, role: .user, text: text,
-            status: .final_, timestamp: Date()
+    func sendMessage(conversationId: String, text: String, attachments: [PendingAttachment] = []) async {
+        guard let client = bridgeClient else { return }
+        let tempId = "local-\(UUID().uuidString)"
+        let now = ISO8601DateFormatter().string(from: Date())
+        let optimisticAttachments = attachments.map { pending in
+            LPAttachment(
+                id: "local-\(pending.id.uuidString)",
+                filename: pending.filename,
+                contentType: pending.contentType,
+                byteSize: pending.data.count,
+                url: nil,
+                createdAt: now
+            )
+        }
+        let optimisticMessage = LPMessage(
+            id: tempId,
+            conversationId: conversationId,
+            role: .user,
+            content: text,
+            status: .sending,
+            attachments: optimisticAttachments,
+            sourceEventId: nil,
+            createdAt: now,
+            updatedAt: now
         )
-        upsertMessage(userMsg)
+        upsertMessage(optimisticMessage)
+        touchConversation(conversationId)
 
-        sendingInSession = sessionKey
-        defer { sendingInSession = nil }
-
+        sendingInConversation = conversationId
+        setTyping(true, conversationId: conversationId)
+        defer {
+            if sendingInConversation == conversationId {
+                sendingInConversation = nil
+            }
+        }
         do {
-            try await client.sendToSession(sessionKey, message: text)
+            var attachmentIds: [String] = []
+            for attachment in attachments {
+                let uploaded = try await client.uploadAttachment(
+                    data: attachment.data,
+                    filename: attachment.filename,
+                    contentType: attachment.contentType
+                )
+                attachmentIds.append(uploaded.attachment.id)
+            }
+            let resp = try await client.sendMessage(conversationId: conversationId, text: text, attachmentIds: attachmentIds)
+            replaceMessage(id: tempId, with: resp.message)
+            touchConversation(conversationId)
+        } catch {
+            setTyping(false, conversationId: conversationId)
+            updateMessageStatus(id: tempId, conversationId: conversationId, status: .failed)
+            lastError = error.localizedDescription
+        }
+    }
+
+    // MARK: - Approval operations
+
+    func respondToApproval(conversationId: String, approvalId: String, decision: String) async {
+        guard let client = bridgeClient else { return }
+        do {
+            try await client.respondToApproval(conversationId: conversationId, approvalId: approvalId, decision: decision)
+            pendingApprovals.removeAll { $0.approvalId == approvalId }
         } catch {
             lastError = error.localizedDescription
         }
     }
 
-    // MARK: - Incoming event handling
+    // MARK: - SSE event handling
 
-    private func handleSessionMessage(_ payload: SessionMessageEventPayload) {
-        let sessionKey = payload.sessionKey
-        let role = LPMessage.Role(rawValue: payload.role ?? "assistant") ?? .assistant
+    func handleSSEEvent(type: String, payload: [String: Any]) {
+        switch type {
+        case "outbound.message":
+            // SSE envelope nests the actual outbound.message event in `payload`.
+            guard
+                let inner = payload["payload"] as? [String: Any],
+                let convId = inner["conversationId"] as? String,
+                let msgData = try? JSONSerialization.data(withJSONObject: inner),
+                let event = try? JSONDecoder().decode(OutboundMessagePayload.self, from: msgData)
+            else { return }
 
-        if let delta = payload.deltaText, !delta.isEmpty {
-            // Streaming: append delta to last assistant message in this session
-            if let idx = messages[sessionKey]?.lastIndex(where: { $0.role == .assistant && $0.status == .streaming }) {
-                messages[sessionKey]![idx].text += delta
-            } else {
-                // Start new streaming message
-                let id = payload.runId ?? UUID().uuidString
-                let msg = LPMessage(
-                    id: id, sessionKey: sessionKey, role: role,
-                    text: delta, status: .streaming
-                )
-                upsertMessage(msg)
-            }
-        } else if payload.replace == true, let text = payload.text {
-            // Replace: overwrite last assistant message
-            if let idx = messages[sessionKey]?.lastIndex(where: { $0.role == .assistant }) {
-                messages[sessionKey]![idx].text = text
-                messages[sessionKey]![idx].status = payload.status == "final" ? .final_ : .streaming
-            }
-        } else if let text = payload.text, !text.isEmpty {
-            // Full message
-            let id = payload.runId ?? UUID().uuidString
-            let status: LPMessage.Status = payload.status == "streaming" ? .streaming : .final_
-            let msg = LPMessage(id: id, sessionKey: sessionKey, role: role, text: text, status: status)
+            let msg = LPMessage(
+                id: event.messageId,
+                conversationId: convId,
+                role: .assistant,
+                content: event.text,
+                status: event.status == "final" ? .final : .streaming,
+                attachments: [],
+                sourceEventId: event.id,
+                createdAt: event.createdAt ?? ISO8601DateFormatter().string(from: Date()),
+                updatedAt: event.createdAt ?? ISO8601DateFormatter().string(from: Date())
+            )
             upsertMessage(msg)
-        }
+            touchConversation(convId)
+            setTyping(event.status != "final", conversationId: convId)
 
-        // Update session preview
-        if let wsId = activeWorkspaceId, var list = sessions[wsId],
-           let si = list.firstIndex(where: { $0.id == sessionKey })
-        {
-            list[si].lastMessagePreview = (payload.text ?? payload.deltaText).flatMap {
-                $0.isEmpty ? nil : String($0.prefix(120))
+        case "outbound.progress":
+            if let inner = payload["payload"] as? [String: Any],
+               let convId = inner["conversationId"] as? String {
+                setTyping(true, conversationId: convId)
             }
-            list[si].lastMessageTs = Date()
-            sessions[wsId] = list
+
+        case "outbound.approval.requested":
+            guard
+                let inner = payload["payload"] as? [String: Any],
+                let convId = inner["conversationId"] as? String,
+                let approvalId = inner["approvalId"] as? String,
+                let title = inner["title"] as? String,
+                let eventId = inner["id"] as? String
+            else { return }
+            pendingApprovals.append(LPApprovalRequest(
+                id: eventId, conversationId: convId, approvalId: approvalId,
+                title: title, body: inner["body"] as? String,
+                expiresAt: inner["expiresAt"] as? String
+            ))
+
+        case "conversation.created":
+            if let conversation = decodeConversationEvent(payload) {
+                applyConversationUpdateOrInsert(conversation)
+                if shouldSurfaceCreatedConversation(conversation, eventPayload: payload) {
+                    markCreatedConversationSurfaced(conversation.id)
+                    newSubagentConversation = conversation
+                }
+            } else {
+                Task { await refreshConversations() }
+            }
+
+        case "conversation.updated":
+            if let conversation = decodeConversationEvent(payload) {
+                if conversation.archivedAt == nil {
+                    applyConversationUpdateOrInsert(conversation)
+                } else {
+                    conversations.removeAll { $0.id == conversation.id }
+                    if selectedConversationId == conversation.id { selectedConversationId = nil }
+                }
+            } else {
+                Task { await refreshConversations() }
+            }
+
+        case "conversation.deleted":
+            let source = (payload["payload"] as? [String: Any]) ?? payload
+            if let id = source["id"] as? String {
+                conversations.removeAll { $0.id == id }
+                archivedConversations.removeAll { $0.id == id }
+                messages.removeValue(forKey: id)
+                if selectedConversationId == id { selectedConversationId = nil }
+            }
+
+        case "plugin.connected":
+            pluginConnected = true
+
+        case "plugin.disconnected":
+            pluginConnected = false
+
+        default:
+            break
         }
     }
 
-    // MARK: - Helpers
+    // MARK: - Private helpers
+
+    private func checkStatus() async {
+        guard let client = bridgeClient else { return }
+        do {
+            let status = try await client.getStatus()
+            pluginConnected = status.plugin.connected
+        } catch {}
+    }
+
+    func isTyping(conversationId: String) -> Bool {
+        typingConversationIds.contains(conversationId)
+    }
+
+    private func setTyping(_ isTyping: Bool, conversationId: String) {
+        if isTyping {
+            typingConversationIds.insert(conversationId)
+            scheduleTypingTimeout(for: conversationId)
+        } else {
+            typingConversationIds.remove(conversationId)
+        }
+    }
+
+    private func scheduleTypingTimeout(for conversationId: String) {
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 45_000_000_000)
+            typingConversationIds.remove(conversationId)
+        }
+    }
+
+    private func scheduleArchiveUndoDismissal(for conversationId: String) {
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 6_000_000_000)
+            if recentlyArchivedConversation?.id == conversationId {
+                recentlyArchivedConversation = nil
+            }
+        }
+    }
+
+    private func registerPendingPushTokenIfNeeded() async {
+        guard let client = bridgeClient, let token = pendingApnsToken else { return }
+        do {
+            let response = try await client.registerPushToken(token, environment: apnsEnvironment)
+            if !response.relayConfigured {
+                lastError = "Push token saved, but the bridge push relay is not configured."
+            }
+            pendingApnsToken = nil
+        } catch {
+            lastError = error.localizedDescription
+        }
+    }
+
+    private var apnsEnvironment: String {
+        #if DEBUG
+        "sandbox"
+        #else
+        "production"
+        #endif
+    }
 
     private func upsertMessage(_ msg: LPMessage) {
-        var list = messages[msg.sessionKey] ?? []
+        var list = messages[msg.conversationId] ?? []
         if let idx = list.firstIndex(where: { $0.id == msg.id }) {
             list[idx] = msg
         } else {
             list.append(msg)
         }
-        messages[msg.sessionKey] = list
+        messages[msg.conversationId] = list
     }
+
+    private func replaceMessage(id oldId: String, with newMessage: LPMessage) {
+        var list = messages[newMessage.conversationId] ?? []
+        if let idx = list.firstIndex(where: { $0.id == oldId }) {
+            list[idx] = newMessage
+        } else if let idx = list.firstIndex(where: { $0.id == newMessage.id }) {
+            list[idx] = newMessage
+        } else {
+            list.append(newMessage)
+        }
+        messages[newMessage.conversationId] = list.sorted { $0.createdAt < $1.createdAt }
+    }
+
+    private func updateMessageStatus(id: String, conversationId: String, status: LPMessage.MessageStatus) {
+        var list = messages[conversationId] ?? []
+        guard let idx = list.firstIndex(where: { $0.id == id }) else { return }
+        var message = list[idx]
+        message.status = status
+        message.updatedAt = ISO8601DateFormatter().string(from: Date())
+        list[idx] = message
+        messages[conversationId] = list
+    }
+
+    private func applyConversationUpdate(_ conv: LPConversation) {
+        if let idx = conversations.firstIndex(where: { $0.id == conv.id }) {
+            conversations[idx] = conv
+        }
+    }
+
+    private func applyConversationUpdateOrInsert(_ conv: LPConversation) {
+        if let idx = conversations.firstIndex(where: { $0.id == conv.id }) {
+            conversations[idx] = conv
+        } else {
+            conversations.insert(conv, at: 0)
+        }
+        conversations = sortConversations(conversations)
+    }
+
+    private func decodeConversationEvent(_ payload: [String: Any]) -> LPConversation? {
+        let source = (payload["payload"] as? [String: Any]) ?? payload
+        guard let data = try? JSONSerialization.data(withJSONObject: source) else { return nil }
+        return try? JSONDecoder().decode(LPConversation.self, from: data)
+    }
+
+    private func shouldSurfaceCreatedConversation(_ conversation: LPConversation, eventPayload: [String: Any]) -> Bool {
+        conversation.kind == .subagent
+            && !isMuted(conversation.id)
+            && !surfacedCreatedConversationIds.contains(conversation.id)
+            && isFreshEvent(eventPayload)
+    }
+
+    private func isFreshEvent(_ payload: [String: Any]) -> Bool {
+        guard let createdAt = payload["createdAt"] as? String,
+              let date = parseIsoDate(createdAt)
+        else { return false }
+        return date >= conversationCreatedNotificationCutoff
+    }
+
+    private func parseIsoDate(_ value: String) -> Date? {
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = fractional.date(from: value) { return date }
+        return ISO8601DateFormatter().date(from: value)
+    }
+
+    private func touchConversation(_ id: String) {
+        if let idx = conversations.firstIndex(where: { $0.id == id }) {
+            var conv = conversations[idx]
+            conv = LPConversation(
+                id: conv.id, title: conv.title, purpose: conv.purpose,
+                kind: conv.kind, openclawSessionKey: conv.openclawSessionKey,
+                openclawAgentId: conv.openclawAgentId, pinned: conv.pinned,
+                archivedAt: conv.archivedAt,
+                createdAt: conv.createdAt, updatedAt: ISO8601DateFormatter().string(from: Date())
+            )
+            conversations[idx] = conv
+            conversations = sortConversations(conversations)
+        }
+    }
+
+    private func sortConversations(_ input: [LPConversation]) -> [LPConversation] {
+        input.sorted {
+            if $0.kind == .main && $1.kind != .main { return true }
+            if $1.kind == .main && $0.kind != .main { return false }
+            if $0.pinned != $1.pinned { return $0.pinned }
+            return $0.updatedAt > $1.updatedAt
+        }
+    }
+
+    private func mutedStorageKey() -> String {
+        "muted_conversations_\(activeWorkspaceId?.uuidString ?? "default")"
+    }
+
+    private func surfacedCreatedStorageKey() -> String {
+        "surfaced_created_conversations_\(activeWorkspaceId?.uuidString ?? "default")"
+    }
+
+    private func loadMutedConversationIds() {
+        mutedConversationIds = Set(UserDefaults.standard.stringArray(forKey: mutedStorageKey()) ?? [])
+    }
+
+    private func saveMutedConversationIds() {
+        UserDefaults.standard.set(Array(mutedConversationIds), forKey: mutedStorageKey())
+    }
+
+    private func loadSurfacedCreatedConversationIds() {
+        surfacedCreatedConversationIds = Set(UserDefaults.standard.stringArray(forKey: surfacedCreatedStorageKey()) ?? [])
+    }
+
+    private func markCreatedConversationSurfaced(_ id: String) {
+        surfacedCreatedConversationIds.insert(id)
+        UserDefaults.standard.set(Array(surfacedCreatedConversationIds), forKey: surfacedCreatedStorageKey())
+    }
+
+    private func seedSurfacedCreatedConversationIds(from conversations: [LPConversation]) {
+        var changed = false
+        for conversation in conversations where conversation.kind == .subagent {
+            let createdAt = parseIsoDate(conversation.createdAt)
+            guard createdAt == nil || createdAt! < conversationCreatedNotificationCutoff else { continue }
+            if surfacedCreatedConversationIds.insert(conversation.id).inserted {
+                changed = true
+            }
+        }
+        if changed {
+            UserDefaults.standard.set(Array(surfacedCreatedConversationIds), forKey: surfacedCreatedStorageKey())
+        }
+    }
+}
+
+private struct OutboundMessagePayload: Decodable {
+    let id: String
+    let messageId: String
+    let conversationId: String
+    let text: String
+    let status: String
+    let createdAt: String?
 }

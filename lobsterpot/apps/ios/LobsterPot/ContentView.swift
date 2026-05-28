@@ -5,24 +5,32 @@ struct ContentView: View {
     @State private var showWorkspacePicker = false
     @State private var showAddWorkspace = false
     @State private var showSettings = false
-    @State private var selectedSessionKey: String?
-    @State private var showNotConnectedAlert = false
+    @State private var showNewConversation = false
+    @State private var selectedConversationId: String?
 
     var body: some View {
         NavigationSplitView {
-            ConversationListView(selectedSessionKey: $selectedSessionKey)
+            ConversationListView(selectedConversationId: $selectedConversationId)
                 .toolbar {
                     ToolbarItem(placement: .navigationBarLeading) {
                         workspaceButton
                     }
                     ToolbarItemGroup(placement: .navigationBarTrailing) {
-                        settingsButton
-                        newSessionButton
+                        Button {
+                            showSettings = true
+                        } label: {
+                            Image(systemName: "gearshape")
+                        }
+                        Button {
+                            showNewConversation = true
+                        } label: {
+                            Image(systemName: "square.and.pencil")
+                        }
                     }
                 }
         } detail: {
-            if let key = selectedSessionKey {
-                ChatView(sessionKey: key)
+            if let id = selectedConversationId {
+                ChatView(conversationId: id)
             } else {
                 emptyDetail
             }
@@ -36,11 +44,62 @@ struct ContentView: View {
         .sheet(isPresented: $showSettings) {
             SettingsView()
         }
-        .alert("Not Connected", isPresented: $showNotConnectedAlert) {
-            Button("OK", role: .cancel) { }
-        } message: {
-            Text("Connect to a gateway first. Tap the gear icon to manage workspaces.")
+        .sheet(isPresented: $showNewConversation) {
+            NewConversationView { conversation in
+                selectedConversationId = conversation.id
+            }
         }
+        .overlay(alignment: .top) {
+            VStack(spacing: 8) {
+                if let conversation = appState.newSubagentConversation {
+                    Button {
+                        selectedConversationId = conversation.id
+                        appState.newSubagentConversation = nil
+                    } label: {
+                        HStack(spacing: 10) {
+                            Image(systemName: "person.2.wave.2.fill")
+                                .foregroundStyle(.blue)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("\(conversation.displayTitle) is ready")
+                                    .font(.headline)
+                                Text("Tap to open")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                        }
+                        .padding(12)
+                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                        .shadow(radius: 10, y: 4)
+                    }
+                    .buttonStyle(.plain)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                }
+
+                if let conversation = appState.recentlyArchivedConversation {
+                    HStack(spacing: 10) {
+                        Image(systemName: "archivebox")
+                            .foregroundStyle(.secondary)
+                        Text("Archived \(conversation.displayTitle)")
+                            .font(.subheadline)
+                            .lineLimit(1)
+                        Spacer()
+                        Button("Undo") {
+                            Task { await appState.unarchiveConversation(conversation.id) }
+                        }
+                        .font(.subheadline.weight(.semibold))
+                    }
+                    .padding(12)
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                    .shadow(radius: 10, y: 4)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 10)
+        }
+        .animation(.spring(response: 0.3, dampingFraction: 0.85), value: appState.newSubagentConversation?.id)
+        .animation(.spring(response: 0.3, dampingFraction: 0.85), value: appState.recentlyArchivedConversation?.id)
     }
 
     private var workspaceButton: some View {
@@ -56,53 +115,22 @@ struct ContentView: View {
     }
 
     private var workspaceAvatar: some View {
-        let name = appState.activeWorkspace?.initials ?? "?"
-        let connected: Bool
-        if case .connected = appState.activeConnectionState { connected = true } else { connected = false }
-
+        let ws = appState.activeWorkspace
+        let color = ws?.color ?? .gray
+        let initials = ws?.initials ?? "?"
         return ZStack(alignment: .bottomTrailing) {
             Circle()
-                .fill(.blue.opacity(0.15))
+                .fill(color.opacity(0.18))
                 .frame(width: 30, height: 30)
                 .overlay(
-                    Text(name)
+                    Text(initials)
                         .font(.caption.weight(.bold))
-                        .foregroundStyle(.blue)
+                        .foregroundStyle(color)
                 )
             Circle()
-                .fill(connected ? .green : .red)
+                .fill(appState.isConnected ? Color.green : Color.red)
                 .frame(width: 8, height: 8)
                 .offset(x: 2, y: 2)
-        }
-    }
-
-    private var settingsButton: some View {
-        Button {
-            showSettings = true
-        } label: {
-            Image(systemName: "gearshape")
-        }
-    }
-
-    private var newSessionButton: some View {
-        Button {
-            guard case .connected = appState.activeConnectionState else {
-                showNotConnectedAlert = true
-                return
-            }
-            // If a main session already exists, open it directly
-            if let key = appState.mainSessionKey {
-                selectedSessionKey = key
-                return
-            }
-            // Otherwise create a fresh session
-            Task {
-                if let session = await appState.createSession() {
-                    selectedSessionKey = session.id
-                }
-            }
-        } label: {
-            Image(systemName: "square.and.pencil")
         }
     }
 
@@ -114,6 +142,81 @@ struct ContentView: View {
             Text("Select a conversation")
                 .font(.title3)
                 .foregroundStyle(.secondary)
+            if !appState.pluginConnected {
+                Text("OpenClaw plugin not connected")
+                    .font(.footnote)
+                    .foregroundStyle(.orange)
+            }
+        }
+    }
+}
+
+// MARK: - New Conversation sheet
+
+struct NewConversationView: View {
+    @EnvironmentObject private var appState: AppState
+    @Environment(\.dismiss) private var dismiss
+
+    var onCreated: (LPConversation) -> Void
+
+    @State private var title = ""
+    @State private var purpose = ""
+    @State private var kind: LPConversation.ConversationKind = .specialist
+    @State private var isCreating = false
+    @State private var errorMessage: String?
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    TextField("Title", text: $title)
+                    TextField("Purpose (optional)", text: $purpose, axis: .vertical)
+                        .lineLimit(2...4)
+                }
+                Section("Type") {
+                    Picker("Conversation type", selection: $kind) {
+                        Text("Specialist").tag(LPConversation.ConversationKind.specialist)
+                        Text("Support").tag(LPConversation.ConversationKind.support)
+                    }
+                    .pickerStyle(.segmented)
+                }
+                if let err = errorMessage {
+                    Section {
+                        Text(err).foregroundStyle(.red).font(.footnote)
+                    }
+                }
+            }
+            .navigationTitle("New Conversation")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Create") { create() }
+                        .disabled(title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isCreating)
+                }
+            }
+        }
+    }
+
+    private func create() {
+        errorMessage = nil
+        isCreating = true
+        let trimmedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedPurpose = purpose.trimmingCharacters(in: .whitespacesAndNewlines)
+        Task {
+            defer { isCreating = false }
+            if let conv = await appState.createConversation(
+                title: trimmedTitle,
+                purpose: trimmedPurpose.isEmpty ? nil : trimmedPurpose,
+                kind: kind
+            ) {
+                onCreated(conv)
+                dismiss()
+            } else {
+                errorMessage = appState.lastError ?? "Failed to create conversation"
+            }
         }
     }
 }

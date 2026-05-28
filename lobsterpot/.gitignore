@@ -13,3 +13,5 @@ DerivedData/
 *.xcuserdata/
 apps/bridge/data/
 apps/push-relay/data/
+
+dist-bundle/

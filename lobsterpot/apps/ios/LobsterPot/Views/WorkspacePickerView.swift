@@ -9,11 +9,11 @@ struct WorkspacePickerView: View {
         NavigationStack {
             List {
                 Section {
-                    ForEach(appState.workspaceStore.workspaces) { workspace in
-                        workspaceRow(workspace)
+                    ForEach(appState.workspaceStore.workspaces) { ws in
+                        workspaceRow(ws)
                             .contentShape(Rectangle())
                             .onTapGesture {
-                                appState.switchWorkspace(to: workspace.id)
+                                appState.switchWorkspace(to: ws.id)
                                 dismiss()
                             }
                     }
@@ -40,54 +40,52 @@ struct WorkspacePickerView: View {
         }
     }
 
-    private func workspaceRow(_ workspace: Workspace) -> some View {
-        let state = appState.connectionStates[workspace.id] ?? .disconnected
-        let isActive = appState.activeWorkspaceId == workspace.id
+    private func workspaceRow(_ ws: Workspace) -> some View {
+        let isActive = appState.activeWorkspaceId == ws.id
+        let isConnected = isActive && appState.isConnected
 
         return HStack(spacing: 14) {
-            // Avatar
-            Circle()
-                .fill(.blue.opacity(0.15))
-                .frame(width: 44, height: 44)
-                .overlay(
-                    Text(workspace.initials)
-                        .font(.headline.weight(.bold))
-                        .foregroundStyle(.blue)
-                )
+            ZStack {
+                Circle()
+                    .fill(ws.color.opacity(0.18))
+                    .frame(width: 44, height: 44)
+                Text(ws.initials)
+                    .font(.headline.weight(.bold))
+                    .foregroundStyle(ws.color)
+            }
 
             VStack(alignment: .leading, spacing: 2) {
-                Text(workspace.name)
+                Text(ws.name)
                     .font(.body.weight(isActive ? .semibold : .regular))
-                Text(statusText(state))
+                Text(ws.normalizedUrl)
                     .font(.caption)
-                    .foregroundStyle(statusColor(state))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
             }
 
             Spacer()
 
             if isActive {
-                Image(systemName: "checkmark")
-                    .foregroundStyle(.blue)
+                HStack(spacing: 4) {
+                    Circle()
+                        .fill(isConnected ? Color.green : Color.orange)
+                        .frame(width: 8, height: 8)
+                    Image(systemName: "checkmark")
+                        .foregroundStyle(.blue)
+                        .font(.caption.bold())
+                }
             }
         }
         .padding(.vertical, 4)
-    }
-
-    private func statusText(_ state: GatewayConnectionState) -> String {
-        switch state {
-        case .disconnected: return "Disconnected"
-        case .connecting: return "Connecting…"
-        case .waitingForPairing(let id): return "Approve device \(String(id.prefix(8)))…"
-        case .connected(let ver): return "Connected · v\(ver)"
-        case .error(let msg): return msg
-        }
-    }
-
-    private func statusColor(_ state: GatewayConnectionState) -> Color {
-        switch state {
-        case .connected: return .green
-        case .connecting, .waitingForPairing: return .orange
-        case .disconnected, .error: return .secondary
+        .swipeActions(edge: .trailing) {
+            if appState.workspaceStore.workspaces.count > 1 {
+                Button(role: .destructive) {
+                    appState.removeWorkspace(ws.id)
+                } label: {
+                    Label("Remove", systemImage: "trash")
+                }
+            }
         }
     }
 }

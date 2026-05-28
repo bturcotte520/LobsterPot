@@ -1,9 +1,6 @@
 import SwiftUI
 
-/// Workspace setup / pairing flow.
-///
-/// Used both as the first-run screen (when no workspaces exist) and as the
-/// "Add Workspace" sheet from the workspace picker.
+/// Bridge setup. Used both as first-run and as "Add workspace" sheet.
 struct SetupView: View {
     @EnvironmentObject private var appState: AppState
     @Environment(\.dismiss) private var dismiss
@@ -11,25 +8,29 @@ struct SetupView: View {
     var isAddingWorkspace = false
 
     @State private var workspaceName = ""
-    @State private var gatewayUrl = ""
-    @State private var gatewayToken = ""
+    @State private var bridgeUrl = ""
     @State private var step: Step = .form
     @State private var isWorking = false
     @State private var errorMessage: String?
 
-    enum Step { case form, waitingPairing(deviceId: String), done }
+    @State private var pairingId: String?
+    @State private var pairingCode: String?
+    @State private var codeVerifier: String?
+
+    enum Step {
+        case form
+        case pairing(code: String)
+        case done
+    }
 
     var body: some View {
         NavigationStack {
             VStack(spacing: 24) {
                 header
                 switch step {
-                case .form:
-                    formView
-                case .waitingPairing(let deviceId):
-                    pairingView(deviceId: deviceId)
-                case .done:
-                    doneView
+                case .form: formView
+                case .pairing(let code): pairingView(code: code)
+                case .done: doneView
                 }
                 if let err = errorMessage {
                     Text(err)
@@ -51,21 +52,13 @@ struct SetupView: View {
                 }
             }
         }
-        .onChange(of: appState.activeConnectionState) { _, state in
-            guard case .waitingForPairing(let id) = state else { return }
-            step = .waitingPairing(deviceId: id)
-        }
     }
-
-    // MARK: - Sub-views
 
     private var header: some View {
         VStack(spacing: 8) {
-            Text("🦞")
-                .font(.system(size: 52))
-            Text("LobsterPot")
-                .font(.title.bold())
-            Text("Connect to your OpenClaw Gateway")
+            Text("🦞").font(.system(size: 52))
+            Text("LobsterPot").font(.title.bold())
+            Text(isAddingWorkspace ? "Connect another OpenClaw" : "Connect to your LobsterPot bridge")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -75,25 +68,29 @@ struct SetupView: View {
 
     private var formView: some View {
         VStack(alignment: .leading, spacing: 16) {
-            labeledField("Workspace name", placeholder: "KiloClaw", text: $workspaceName)
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Workspace name").font(.subheadline.weight(.medium))
+                TextField("Home, Work, …", text: $workspaceName)
+                    .textFieldStyle(.roundedBorder)
+                    .textInputAutocapitalization(.words)
+                Text("How this workspace appears in your switcher.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
 
-            labeledField(
-                "Gateway URL",
-                placeholder: "wss://my-gateway.ts.net:18789",
-                text: $gatewayUrl,
-                keyboard: .URL,
-                help: "The WebSocket address of your OpenClaw Gateway. Tailscale hostnames work great here."
-            )
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Bridge URL").font(.subheadline.weight(.medium))
+                TextField("https://my-bridge.fly.dev", text: $bridgeUrl)
+                    .textFieldStyle(.roundedBorder)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .keyboardType(.URL)
+                Text("HTTPS address of your LobsterPot bridge.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
 
-            labeledField(
-                "Gateway token",
-                placeholder: "From gateway.auth.token in openclaw.json",
-                text: $gatewayToken,
-                isSecure: true,
-                help: "Found in ~/.openclaw/openclaw.json → gateway.auth.token on your gateway host."
-            )
-
-            Button(action: connect) {
+            Button(action: startPairing) {
                 Label(isWorking ? "Connecting…" : "Connect", systemImage: "link")
                     .frame(maxWidth: .infinity)
             }
@@ -102,42 +99,36 @@ struct SetupView: View {
         }
     }
 
-    private func pairingView(deviceId: String) -> some View {
+    private func pairingView(code: String) -> some View {
         VStack(spacing: 20) {
-            Image(systemName: "checkmark.shield")
+            Image(systemName: "lock.shield")
                 .font(.system(size: 48))
                 .foregroundStyle(.orange)
-
-            Text("Approve this device")
-                .font(.title3.bold())
-
-            Text("SSH into your Gateway and run:")
+            Text("Pair this device").font(.title3.bold())
+            Text("Tap accept to securely pair with your bridge.")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+            Text(code)
+                .font(.system(.title2, design: .monospaced).bold())
+                .padding(16)
+                .background(.orange.opacity(0.1), in: RoundedRectangle(cornerRadius: 12))
+                .foregroundStyle(.orange)
+                .textSelection(.enabled)
 
-            VStack(alignment: .leading, spacing: 6) {
-                codeBlock("openclaw devices list")
-                codeBlock("openclaw devices approve \\\n  <request-id>")
+            Button(action: finishPairing) {
+                Label(isWorking ? "Verifying…" : "Accept", systemImage: "checkmark")
+                    .frame(maxWidth: .infinity)
             }
+            .buttonStyle(.borderedProminent)
+            .disabled(isWorking)
 
-            VStack(spacing: 4) {
-                Text("Your device ID")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Text(deviceId)
-                    .font(.system(.caption, design: .monospaced))
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
+            Button("Back") {
+                step = .form
+                errorMessage = nil
             }
-
-            HStack(spacing: 8) {
-                ProgressView()
-                    .scaleEffect(0.8)
-                Text("Waiting for approval…")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-            }
-            .padding(.top, 8)
+            .font(.subheadline)
+            .foregroundStyle(.secondary)
         }
         .padding()
     }
@@ -147,89 +138,66 @@ struct SetupView: View {
             Image(systemName: "checkmark.seal.fill")
                 .font(.system(size: 56))
                 .foregroundStyle(.green)
-            Text("Connected!")
-                .font(.title2.bold())
-            Text("Your workspace is ready.")
-                .foregroundStyle(.secondary)
+            Text("Connected!").font(.title2.bold())
+            Text("\(workspaceName) is ready.").foregroundStyle(.secondary)
         }
     }
 
     // MARK: - Actions
 
-    private func connect() {
+    private func startPairing() {
         errorMessage = nil
-        let name = workspaceName.trimmingCharacters(in: .whitespacesAndNewlines)
-        let url = gatewayUrl.trimmingCharacters(in: .whitespacesAndNewlines)
-        let token = gatewayToken.trimmingCharacters(in: .whitespacesAndNewlines)
-
-        let workspace = Workspace(
-            name: name.isEmpty ? "My Gateway" : name,
-            gatewayUrl: url,
-            gatewayToken: token
-        )
-        appState.addWorkspace(workspace)
-
-        // The connection state change drives the UI forward automatically
-        // via the onChange modifier watching activeConnectionState.
-        // Also watch for "connected" state to close setup.
+        isWorking = true
+        let url = bridgeUrl.trimmingCharacters(in: .whitespacesAndNewlines)
         Task {
-            for await _ in Timer.publish(every: 1, on: .main, in: .default).autoconnect().values {
-                if case .connected = appState.activeConnectionState {
-                    step = .done
-                    try? await Task.sleep(nanoseconds: 800_000_000)
-                    if isAddingWorkspace { dismiss() }
-                    break
-                } else if case .error(let msg) = appState.activeConnectionState {
-                    errorMessage = msg
-                    break
-                }
+            defer { isWorking = false }
+            do {
+                let tempConn = BridgeConnection(bridgeUrl: url, deviceToken: "")
+                let client = BridgeClient(connection: tempConn)
+                let (resp, verifier) = try await client.startPairing()
+                pairingCode = resp.code
+                pairingId = resp.pairingId
+                codeVerifier = verifier
+                step = .pairing(code: resp.code)
+            } catch {
+                errorMessage = error.localizedDescription
             }
         }
     }
 
-    // MARK: - Helpers
+    private func finishPairing() {
+        guard let code = pairingCode, let verifier = codeVerifier, let pid = pairingId else {
+            errorMessage = "Pairing state lost — please start over."
+            step = .form
+            return
+        }
+        errorMessage = nil
+        isWorking = true
+        let url = bridgeUrl.trimmingCharacters(in: .whitespacesAndNewlines)
+        let name = workspaceName.trimmingCharacters(in: .whitespacesAndNewlines)
+        Task {
+            defer { isWorking = false }
+            do {
+                let tempConn = BridgeConnection(bridgeUrl: url, deviceToken: "")
+                let client = BridgeClient(connection: tempConn)
+                let resp = try await client.finishPairing(pairingId: pid, code: code, codeVerifier: verifier)
+                appState.addWorkspace(
+                    name: name.isEmpty ? "OpenClaw" : name,
+                    bridgeUrl: url,
+                    deviceToken: resp.token
+                )
+                step = .done
+                try? await Task.sleep(nanoseconds: 800_000_000)
+                if isAddingWorkspace { dismiss() }
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
 
     private var formIsValid: Bool {
-        !gatewayUrl.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
-        !gatewayToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    }
-
-    private func labeledField(
-        _ label: String,
-        placeholder: String,
-        text: Binding<String>,
-        keyboard: UIKeyboardType = .default,
-        isSecure: Bool = false,
-        help: String? = nil
-    ) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(label).font(.subheadline.weight(.medium))
-            if isSecure {
-                SecureField(placeholder, text: text)
-                    .textFieldStyle(.roundedBorder)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-            } else {
-                TextField(placeholder, text: text)
-                    .textFieldStyle(.roundedBorder)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .keyboardType(keyboard)
-            }
-            if let help {
-                Text(help)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-        }
-    }
-
-    private func codeBlock(_ code: String) -> some View {
-        Text(code)
-            .font(.system(.footnote, design: .monospaced))
-            .padding(10)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
-            .textSelection(.enabled)
+        let url = bridgeUrl.trimmingCharacters(in: .whitespacesAndNewlines)
+        return (url.hasPrefix("http://") || url.hasPrefix("https://"))
+            && !workspaceName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 }
