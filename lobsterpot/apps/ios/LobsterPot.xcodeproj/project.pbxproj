@@ -22,6 +22,7 @@
 		814787082969AB2724BE6AB4 /* KeychainHelper.swift in Sources */ = {isa = PBXBuildFile; fileRef = 681A3B67A64FFA8695D238E9 /* KeychainHelper.swift */; };
 		A838DF8C1D81DD1DC3A59EBE /* LobsterPotTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC4685E04C1E15745B44C1DB /* LobsterPotTests.swift */; };
 		D1FC3DF90C603B4FCB055247 /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = 159FD9C1B13FACCA2B3871A3 /* Models.swift */; };
+		D3853452C1CD9D6983E24B83 /* AddOpenClawView.swift in Sources */ = {isa = PBXBuildFile; fileRef = DDD8BF48BAD00E1C3A784AAD /* AddOpenClawView.swift */; };
 		D8A0A31B04EF734937C37F81 /* BridgeClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A34DAD9FB1D5B612F396DDF /* BridgeClient.swift */; };
 		E10B5421E9EA60CE894AB35D /* ConversationListView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 10DE9CFA8B38F870C90F4CB1 /* ConversationListView.swift */; };
 /* End PBXBuildFile section */
@@ -55,6 +56,7 @@
 		B8B8F3A4B80EB2A4A8CCC67E /* AppState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppState.swift; sourceTree = "<group>"; };
 		CFC31B082184EA1384C21C6F /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		DD3504117693755EB40F2DA6 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
+		DDD8BF48BAD00E1C3A784AAD /* AddOpenClawView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AddOpenClawView.swift; sourceTree = "<group>"; };
 		E3FF27EA905B4507571E8A99 /* SetupView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SetupView.swift; sourceTree = "<group>"; };
 		F52BA58669C9EB786F2ECD9A /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		FE0A202F082F7EEEC0DCE15F /* ChatView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatView.swift; sourceTree = "<group>"; };
@@ -93,6 +95,7 @@
 		42F7BA37DDB4053BE110591B /* Views */ = {
 			isa = PBXGroup;
 			children = (
+				DDD8BF48BAD00E1C3A784AAD /* AddOpenClawView.swift */,
 				FE0A202F082F7EEEC0DCE15F /* ChatView.swift */,
 				10DE9CFA8B38F870C90F4CB1 /* ConversationListView.swift */,
 				386981F5E81ED23F63A2F457 /* SettingsView.swift */,
@@ -230,6 +233,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				D3853452C1CD9D6983E24B83 /* AddOpenClawView.swift in Sources */,
 				1F73448ADFB4EDDFD9F443C0 /* AppDelegate.swift in Sources */,
 				363697E0E3D6E7D3E97940E8 /* AppState.swift in Sources */,
 				D8A0A31B04EF734937C37F81 /* BridgeClient.swift in Sources */,

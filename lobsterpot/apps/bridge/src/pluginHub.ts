@@ -24,7 +24,7 @@ type ActivePlugin = {
 };
 
 export class PluginHub {
-  private active: ActivePlugin | null = null;
+  private readonly activeByInstance = new Map<string, ActivePlugin>();
 
   constructor(
     private readonly database: BridgeDatabase,
@@ -46,7 +46,8 @@ export class PluginHub {
   }
 
   status(): PluginConnectionStatus {
-    if (!this.active) {
+    const active = this.firstActive();
+    if (!active) {
       return {
         connected: false,
         status: "waiting",
@@ -56,24 +57,32 @@ export class PluginHub {
       };
     }
     return {
-      connected: this.active.socket.readyState === this.active.socket.OPEN,
-      status: this.active.socket.readyState === this.active.socket.OPEN ? "connected" : "stale",
-      instanceId: this.active.instanceId,
-      lastSeenAt: this.active.lastSeenAt,
-      capabilities: this.active.capabilities
+      connected: active.socket.readyState === active.socket.OPEN,
+      status: active.socket.readyState === active.socket.OPEN ? "connected" : "stale",
+      instanceId: active.instanceId,
+      lastSeenAt: active.lastSeenAt,
+      capabilities: active.capabilities
     };
   }
 
-  sendToPlugin(event: BridgeToPluginEvent): boolean {
-    if (!this.active || this.active.socket.readyState !== this.active.socket.OPEN) {
+  sendToPlugin(event: BridgeToPluginEvent, instanceId?: string | null): boolean {
+    const active = instanceId ? this.activeByInstance.get(instanceId) : this.firstActive();
+    if (!active || active.socket.readyState !== active.socket.OPEN) {
       return false;
     }
-    this.active.socket.send(JSON.stringify(event));
+    active.socket.send(JSON.stringify(event));
     return true;
   }
 
-  sendInboundMessage(event: InboundMessage): boolean {
-    return this.sendToPlugin(event);
+  sendInboundMessage(event: InboundMessage, instanceId?: string | null): boolean {
+    return this.sendToPlugin(event, instanceId);
+  }
+
+  private firstActive(): ActivePlugin | null {
+    for (const active of this.activeByInstance.values()) {
+      if (active.socket.readyState === active.socket.OPEN) return active;
+    }
+    return null;
   }
 
   private acceptSocket(socket: WebSocket): void {
@@ -108,24 +117,27 @@ export class PluginHub {
         return;
       }
 
+      const instance = this.database.getOpenClawInstanceByTokenId(token.id);
+      const openclawInstanceId = instance?.id ?? event.instanceId;
+
       authenticated = true;
       const connectionId = randomUUID();
-      this.active?.socket.close();
-      this.active = {
+      this.activeByInstance.get(openclawInstanceId)?.socket.close();
+      this.activeByInstance.set(openclawInstanceId, {
         connectionId,
         socket,
-        instanceId: event.instanceId,
+        instanceId: openclawInstanceId,
         tokenId: token.id,
         capabilities: event.capabilities,
         lastSeenAt: nowIso()
-      };
+      });
 
-      console.log(`[bridge] plugin connected instance=${event.instanceId} connection=${connectionId}`);
+      console.log(`[bridge] plugin connected instance=${openclawInstanceId} connection=${connectionId}`);
 
       this.database.upsertPluginConnection({
         id: connectionId,
         bridgeTokenId: token.id,
-        instanceId: event.instanceId,
+        instanceId: openclawInstanceId,
         status: "connected",
         capabilities: event.capabilities
       });
@@ -144,7 +156,7 @@ export class PluginHub {
         payload: sanitizeHello(event)
       });
 
-      socket.on("message", (message) => this.onPluginMessage(message));
+      socket.on("message", (message) => this.onPluginMessage(openclawInstanceId, message));
       socket.on("close", (code, reason) => this.onPluginClose(connectionId, code, reason.toString("utf8")));
       socket.on("error", (error) => {
         console.warn(`[bridge] plugin socket error connection=${connectionId}: ${error.message}`);
@@ -157,19 +169,20 @@ export class PluginHub {
     });
   }
 
-  private onPluginMessage(data: RawData): void {
+  private onPluginMessage(instanceId: string, data: RawData): void {
     const parsed = safeJsonParse(parseRaw(data));
     const event = parsePluginEventSafe(parsed);
     if (!event || event.type === "hello") return;
 
-    if (this.active) {
-      this.active.lastSeenAt = nowIso();
+    const active = this.activeByInstance.get(instanceId);
+    if (active) {
+      active.lastSeenAt = nowIso();
     }
 
-    this.handlePluginEvent(event);
+    this.handlePluginEvent(instanceId, event);
   }
 
-  private handlePluginEvent(event: PluginToBridgeEvent): void {
+  private handlePluginEvent(instanceId: string, event: PluginToBridgeEvent): void {
     switch (event.type) {
       case "outbound.message": {
         console.log(`[bridge] plugin outbound.message conversation=${event.conversationId} status=${event.status}`);
@@ -208,7 +221,8 @@ export class PluginHub {
   }
 
   private onPluginClose(connectionId: string, code?: number, reason?: string): void {
-    if (this.active?.connectionId !== connectionId) return;
+    const active = [...this.activeByInstance.values()].find((entry) => entry.connectionId === connectionId);
+    if (!active) return;
     console.log(`[bridge] plugin disconnected connection=${connectionId}${code ? ` code=${code}` : ""}${reason ? ` reason=${reason}` : ""}`);
     this.database.markPluginStale(connectionId);
     this.events.publish({
@@ -216,7 +230,7 @@ export class PluginHub {
       type: "plugin.disconnected",
       payload: { connectionId }
     });
-    this.active = null;
+    this.activeByInstance.delete(active.instanceId);
   }
 }
 

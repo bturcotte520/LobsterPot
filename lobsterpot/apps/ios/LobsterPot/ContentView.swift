@@ -117,7 +117,8 @@ struct ContentView: View {
     private var workspaceAvatar: some View {
         let ws = appState.activeWorkspace
         let color = ws?.color ?? .gray
-        let initials = ws?.initials ?? "?"
+        let activeName = appState.activeOpenClaw?.name ?? ws?.name
+        let initials = activeName?.split(separator: " ").prefix(2).compactMap { $0.first.map(String.init) }.joined().uppercased() ?? "?"
         return ZStack(alignment: .bottomTrailing) {
             Circle()
                 .fill(color.opacity(0.18))

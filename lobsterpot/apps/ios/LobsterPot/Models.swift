@@ -4,6 +4,7 @@ import Foundation
 
 struct LPConversation: Codable, Identifiable, Equatable {
     let id: String
+    let openclawInstanceId: String?
     var title: String
     var purpose: String?
     let kind: ConversationKind
@@ -127,6 +128,29 @@ struct BridgeStatusResponse: Codable {
         let lastSeenAt: String?
         let capabilities: [String]
     }
+}
+
+struct OpenClawInstance: Codable, Identifiable, Equatable {
+    let id: String
+    let name: String
+    let connected: Bool
+    let capabilities: [String]
+    let lastSeenAt: String?
+    let createdAt: String
+    let updatedAt: String
+}
+
+struct OpenClawListResponse: Codable {
+    let openclaws: [OpenClawInstance]
+}
+
+struct CreateOpenClawResponse: Codable {
+    let openclaw: OpenClawInstance
+    let token: String
+}
+
+struct OpenClawResponse: Codable {
+    let openclaw: OpenClawInstance
 }
 
 struct PushRegistrationResponse: Codable {

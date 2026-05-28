@@ -4,6 +4,7 @@ struct SettingsView: View {
     @EnvironmentObject private var appState: AppState
     @Environment(\.dismiss) private var dismiss
     @State private var showAddWorkspace = false
+    @State private var showAddOpenClaw = false
     @State private var showArchive = false
     @State private var confirmRemove: Workspace?
 
@@ -13,6 +14,7 @@ struct SettingsView: View {
                 workspacesSection
                 if appState.activeWorkspace != nil {
                     activeWorkspaceSection
+                    openclawsSection
                     archiveSection
                     pluginSection
                 }
@@ -28,6 +30,9 @@ struct SettingsView: View {
             }
             .sheet(isPresented: $showAddWorkspace) {
                 SetupView(isAddingWorkspace: true)
+            }
+            .sheet(isPresented: $showAddOpenClaw) {
+                AddOpenClawView()
             }
             .sheet(isPresented: $showArchive) {
                 ArchiveView()
@@ -101,6 +106,39 @@ struct SettingsView: View {
                     .frame(width: 8, height: 8)
                 Text(appState.isConnected ? "Connected" : "Disconnected")
                     .foregroundStyle(appState.isConnected ? .primary : .secondary)
+            }
+        }
+    }
+
+    private var openclawsSection: some View {
+        Section("OpenClaws") {
+            if appState.openclaws.isEmpty {
+                Text("No OpenClaws registered on this hub yet.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(appState.openclaws) { openclaw in
+                    HStack {
+                        Circle()
+                            .fill(openclaw.connected ? Color.green : Color.orange)
+                            .frame(width: 8, height: 8)
+                        Text(openclaw.name)
+                        Spacer()
+                        if appState.activeOpenClawId == openclaw.id {
+                            Image(systemName: "checkmark")
+                                .foregroundStyle(.blue)
+                        }
+                    }
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        Task { await appState.switchOpenClaw(to: openclaw.id) }
+                    }
+                }
+            }
+            Button {
+                showAddOpenClaw = true
+            } label: {
+                Label("Add OpenClaw", systemImage: "plus.circle")
             }
         }
     }

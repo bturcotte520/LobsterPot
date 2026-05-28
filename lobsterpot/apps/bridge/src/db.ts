@@ -2,7 +2,7 @@ import Database from "better-sqlite3";
 import { readFileSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { Attachment, Conversation, Message, PublicBridgeEvent } from "@lobsterpot/protocol";
+import type { Attachment, Conversation, Message, OpenClawInstance, PublicBridgeEvent } from "@lobsterpot/protocol";
 import { createId, createToken, nowIso, sha256 } from "@lobsterpot/shared";
 
 const currentDir = dirname(fileURLToPath(import.meta.url));
@@ -50,6 +50,7 @@ type BridgeTokenRow = {
 
 type ConversationRow = {
   id: string;
+  openclaw_instance_id: string | null;
   title: string;
   purpose: string | null;
   kind: Conversation["kind"];
@@ -57,6 +58,15 @@ type ConversationRow = {
   openclaw_agent_id: string | null;
   pinned: 0 | 1;
   archived_at: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+type OpenClawInstanceRow = {
+  id: string;
+  name: string;
+  bridge_token_id: string;
+  revoked_at: string | null;
   created_at: string;
   updated_at: string;
 };
@@ -160,6 +170,50 @@ export class BridgeDatabase {
     `).get(sha256(token)) as BridgeTokenRow | undefined ?? null;
   }
 
+  createOpenClawInstance(input: { name: string }): OpenClawInstance & { token: string } {
+    const token = this.createBridgeToken(input.name);
+    const id = createId();
+    const now = nowIso();
+    this.db.prepare(`
+      INSERT INTO openclaw_instances (id, name, bridge_token_id, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(id, input.name, token.id, now, now);
+    const instance = this.getOpenClawInstance(id)!;
+    return { ...instance, token: token.token };
+  }
+
+  getOpenClawInstance(id: string): OpenClawInstance | null {
+    const row = this.db.prepare(`
+      SELECT * FROM openclaw_instances WHERE id = ? AND revoked_at IS NULL LIMIT 1
+    `).get(id) as OpenClawInstanceRow | undefined;
+    return row ? this.toOpenClawInstance(row) : null;
+  }
+
+  getOpenClawInstanceByTokenId(tokenId: string): OpenClawInstance | null {
+    const row = this.db.prepare(`
+      SELECT * FROM openclaw_instances WHERE bridge_token_id = ? AND revoked_at IS NULL LIMIT 1
+    `).get(tokenId) as OpenClawInstanceRow | undefined;
+    return row ? this.toOpenClawInstance(row) : null;
+  }
+
+  listOpenClawInstances(): OpenClawInstance[] {
+    const rows = this.db.prepare(`
+      SELECT * FROM openclaw_instances WHERE revoked_at IS NULL ORDER BY created_at ASC
+    `).all() as OpenClawInstanceRow[];
+    return rows.map((row) => this.toOpenClawInstance(row));
+  }
+
+  updateOpenClawInstance(id: string, input: { name?: string; revoked?: boolean }): OpenClawInstance | null {
+    const current = this.getOpenClawInstance(id);
+    if (!current) return null;
+    const name = input.name ?? current.name;
+    const revokedAt = input.revoked ? nowIso() : null;
+    this.db.prepare(`
+      UPDATE openclaw_instances SET name = ?, revoked_at = ?, updated_at = ? WHERE id = ?
+    `).run(name, revokedAt, nowIso(), id);
+    return this.getOpenClawInstance(id);
+  }
+
   upsertPluginConnection(input: {
     id: string;
     bridgeTokenId: string;
@@ -180,6 +234,31 @@ export class BridgeDatabase {
     `).run(input.id, input.bridgeTokenId, input.instanceId, input.status, now, JSON.stringify(input.capabilities), now, now);
   }
 
+  private getOpenClawConnection(instanceId: string): { lastSeenAt: string | null; capabilities: string[]; connected: boolean } {
+    const row = this.db.prepare(`
+      SELECT status, last_seen_at, capabilities_json FROM plugin_connections
+      WHERE instance_id = ?
+      ORDER BY updated_at DESC LIMIT 1
+    `).get(instanceId) as { status: string; last_seen_at: string | null; capabilities_json: string } | undefined;
+    if (!row) return { lastSeenAt: null, capabilities: [], connected: false };
+    let capabilities: string[] = [];
+    try { capabilities = JSON.parse(row.capabilities_json) as string[]; } catch {}
+    return { lastSeenAt: row.last_seen_at, capabilities, connected: row.status === "connected" };
+  }
+
+  private toOpenClawInstance(row: OpenClawInstanceRow): OpenClawInstance {
+    const connection = this.getOpenClawConnection(row.id);
+    return {
+      id: row.id,
+      name: row.name,
+      connected: connection.connected,
+      capabilities: connection.capabilities,
+      lastSeenAt: connection.lastSeenAt,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at
+    };
+  }
+
   markPluginStale(connectionId: string): void {
     this.db.prepare(`
       UPDATE plugin_connections SET status = 'stale', updated_at = ? WHERE id = ?
@@ -188,37 +267,43 @@ export class BridgeDatabase {
 
   // ── Conversations ────────────────────────────────────────────────────────
 
-  listConversations(input: { archived?: boolean } = {}): Conversation[] {
+  listConversations(input: { archived?: boolean; openclawInstanceId?: string | null } = {}): Conversation[] {
     const archived = input.archived ?? false;
+    const instanceClause = input.openclawInstanceId === undefined ? "" : "AND openclaw_instance_id IS ?";
     const rows = this.db.prepare(`
       SELECT * FROM conversations
       WHERE ${archived ? "archived_at IS NOT NULL" : "archived_at IS NULL"}
+      ${instanceClause}
       ORDER BY CASE WHEN kind = 'main' THEN 1 ELSE 0 END DESC, pinned DESC, updated_at DESC
-    `).all() as ConversationRow[];
+    `).all(...(input.openclawInstanceId === undefined ? [] : [input.openclawInstanceId])) as ConversationRow[];
     return rows.map(toConversation);
   }
 
-  search(input: { query: string; includeArchived?: boolean; limit?: number }): { conversations: Conversation[]; messages: Message[] } {
+  search(input: { query: string; includeArchived?: boolean; openclawInstanceId?: string | null; limit?: number }): { conversations: Conversation[]; messages: Message[] } {
     const q = `%${input.query.trim().replace(/[\\%_]/g, "\\$&")}%`;
     const limit = input.limit ?? 50;
     const includeArchived = input.includeArchived ?? false;
     const archivedClause = includeArchived ? "" : "AND c.archived_at IS NULL";
+    const instanceClause = input.openclawInstanceId === undefined ? "" : "AND c.openclaw_instance_id IS ?";
+    const instanceParams = input.openclawInstanceId === undefined ? [] : [input.openclawInstanceId];
     const conversationRows = this.db.prepare(`
       SELECT DISTINCT c.* FROM conversations c
       LEFT JOIN messages m ON m.conversation_id = c.id
       WHERE (c.title LIKE ? ESCAPE '\\' OR c.purpose LIKE ? ESCAPE '\\' OR m.content LIKE ? ESCAPE '\\')
         ${archivedClause}
+        ${instanceClause}
       ORDER BY CASE WHEN c.kind = 'main' THEN 1 ELSE 0 END DESC, c.pinned DESC, c.updated_at DESC
       LIMIT ?
-    `).all(q, q, q, limit) as ConversationRow[];
+    `).all(q, q, q, ...instanceParams, limit) as ConversationRow[];
     const messageRows = this.db.prepare(`
       SELECT m.* FROM messages m
       JOIN conversations c ON c.id = m.conversation_id
       WHERE m.content LIKE ? ESCAPE '\\'
         ${archivedClause}
+        ${instanceClause}
       ORDER BY m.created_at DESC
       LIMIT ?
-    `).all(q, limit) as MessageRow[];
+    `).all(q, ...instanceParams, limit) as MessageRow[];
     return {
       conversations: conversationRows.map(toConversation),
       messages: this.attachAttachments(messageRows.map(toMessage))
@@ -232,6 +317,7 @@ export class BridgeDatabase {
 
   createConversation(input: {
     title: string;
+    openclawInstanceId?: string | null;
     purpose?: string | null;
     kind?: Conversation["kind"];
     openclawSessionKey?: string | null;
@@ -244,9 +330,9 @@ export class BridgeDatabase {
     const id = createId();
     const now = nowIso();
     this.db.prepare(`
-      INSERT INTO conversations (id, title, purpose, kind, openclaw_session_key, openclaw_agent_id, pinned, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)
-    `).run(id, input.title, input.purpose ?? null, input.kind ?? "specialist", input.openclawSessionKey ?? null, input.openclawAgentId ?? null, now, now);
+      INSERT INTO conversations (id, openclaw_instance_id, title, purpose, kind, openclaw_session_key, openclaw_agent_id, pinned, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+    `).run(id, input.openclawInstanceId ?? null, input.title, input.purpose ?? null, input.kind ?? "specialist", input.openclawSessionKey ?? null, input.openclawAgentId ?? null, now, now);
     return this.getConversation(id)!;
   }
 
@@ -481,6 +567,7 @@ export class BridgeDatabase {
 function toConversation(row: ConversationRow): Conversation {
   return {
     id: row.id,
+    openclawInstanceId: row.openclaw_instance_id,
     title: row.kind === "main" ? "Main Agent" : row.title,
     purpose: row.purpose,
     kind: row.kind,

@@ -84,21 +84,43 @@ final class BridgeClient: @unchecked Sendable {
 
     // MARK: - Conversations
 
-    func getConversations(archived: Bool = false) async throws -> ConversationListResponse {
-        try await get(archived ? "/api/conversations?archived=true" : "/api/conversations")
+    func getConversations(archived: Bool = false, openclawInstanceId: String? = nil) async throws -> ConversationListResponse {
+        var parts: [String] = []
+        if archived { parts.append("archived=true") }
+        if let openclawInstanceId { parts.append("openclawInstanceId=\(openclawInstanceId)") }
+        let query = parts.isEmpty ? "" : "?\(parts.joined(separator: "&"))"
+        return try await get("/api/conversations\(query)")
     }
 
-    func search(query: String, includeArchived: Bool = false) async throws -> SearchResponse {
+    func getOpenClaws() async throws -> OpenClawListResponse {
+        try await get("/api/openclaws")
+    }
+
+    func createOpenClaw(name: String) async throws -> CreateOpenClawResponse {
+        try await post("/api/openclaws", body: ["name": name])
+    }
+
+    func updateOpenClaw(id: String, name: String? = nil, revoked: Bool? = nil) async throws -> OpenClawInstance {
+        var body: [String: Any] = [:]
+        if let name { body["name"] = name }
+        if let revoked { body["revoked"] = revoked }
+        let response: OpenClawResponse = try await patch("/api/openclaws/\(id)", body: body)
+        return response.openclaw
+    }
+
+    func search(query: String, includeArchived: Bool = false, openclawInstanceId: String? = nil) async throws -> SearchResponse {
         var allowed = CharacterSet.urlQueryAllowed
         allowed.remove(charactersIn: "&=?+")
         let encoded = query.addingPercentEncoding(withAllowedCharacters: allowed) ?? query
         let archived = includeArchived ? "&includeArchived=true" : ""
-        return try await get("/api/search?q=\(encoded)\(archived)")
+        let instance = openclawInstanceId.map { "&openclawInstanceId=\($0)" } ?? ""
+        return try await get("/api/search?q=\(encoded)\(archived)\(instance)")
     }
 
-    func createConversation(title: String, purpose: String?, kind: String) async throws -> ConversationResponse {
+    func createConversation(title: String, purpose: String?, kind: String, openclawInstanceId: String? = nil) async throws -> ConversationResponse {
         var body: [String: Any] = ["title": title, "kind": kind]
         if let purpose { body["purpose"] = purpose }
+        if let openclawInstanceId { body["openclawInstanceId"] = openclawInstanceId }
         return try await post("/api/conversations", body: body)
     }
 

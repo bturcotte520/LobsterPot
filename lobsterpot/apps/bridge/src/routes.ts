@@ -70,6 +70,7 @@ export type RouteDeps = {
 
 const createConversationSchema = z.object({
   title: z.string().min(1).default("New Conversation"),
+  openclawInstanceId: z.string().uuid().optional().nullable(),
   purpose: z.string().optional().nullable(),
   kind: z.enum(["main", "subagent", "specialist", "support", "system"]).default("specialist"),
   openclawSessionKey: z.string().min(1).optional().nullable(),
@@ -100,6 +101,7 @@ function requirePluginAuth(database: BridgeDatabase): MiddlewareHandler {
     if (!token) return c.json({ error: "missing_token" }, 401);
     const row = database.validateBridgeToken(token);
     if (!row) return c.json({ error: "invalid_token" }, 401);
+    c.set("bridgeTokenId" as never, row.id as never);
     await next();
   };
 }
@@ -227,14 +229,37 @@ export function createApp(deps: RouteDeps): Hono {
 
   app.get("/api/conversations", auth, (c) => {
     const archived = c.req.query("archived") === "true";
-    return c.json({ conversations: deps.database.listConversations({ archived }) });
+    const openclawInstanceId = c.req.query("openclawInstanceId");
+    return c.json({ conversations: deps.database.listConversations({ archived, openclawInstanceId }) });
+  });
+
+  app.get("/api/openclaws", auth, (c) => c.json({ openclaws: deps.database.listOpenClawInstances() }));
+
+  app.post("/api/openclaws", auth, async (c) => {
+    const body = z.object({ name: z.string().min(1).default("OpenClaw") }).parse(await readJson(c.req.raw));
+    const created = deps.database.createOpenClawInstance({ name: body.name });
+    deps.database.createConversation({
+      title: "Main Agent",
+      kind: "main",
+      openclawInstanceId: created.id
+    });
+    return c.json({ openclaw: withoutToken(created), token: created.token }, 201);
+  });
+
+  app.patch("/api/openclaws/:id", auth, async (c) => {
+    const body = z.object({ name: z.string().min(1).optional(), revoked: z.boolean().optional() }).parse(await readJson(c.req.raw));
+    const openclaw = deps.database.updateOpenClawInstance(c.req.param("id")!, body);
+    if (!openclaw && body.revoked) return c.json({ ok: true });
+    if (!openclaw) return c.json({ error: "openclaw_not_found" }, 404);
+    return c.json({ openclaw });
   });
 
   app.get("/api/search", auth, (c) => {
     const query = (c.req.query("q") ?? "").trim();
     if (!query) return c.json({ conversations: [], messages: [] });
     const includeArchived = c.req.query("includeArchived") === "true";
-    return c.json(deps.database.search({ query, includeArchived }));
+    const openclawInstanceId = c.req.query("openclawInstanceId");
+    return c.json(deps.database.search({ query, includeArchived, openclawInstanceId }));
   });
 
   app.post("/api/conversations", auth, async (c) => {
@@ -352,7 +377,7 @@ export function createApp(deps: RouteDeps): Hono {
       }
     });
 
-    const accepted = deps.pluginHub.sendInboundMessage(event);
+    const accepted = deps.pluginHub.sendInboundMessage(event, conversation.openclawInstanceId);
     deps.events.publish({
       direction: "out",
       type: event.type,
@@ -377,7 +402,7 @@ export function createApp(deps: RouteDeps): Hono {
       conversationId: conversation.id,
       payload
     });
-    return c.json({ accepted: deps.pluginHub.sendToPlugin(payload as never) }, 202);
+    return c.json({ accepted: deps.pluginHub.sendToPlugin(payload as never, conversation.openclawInstanceId) }, 202);
   });
 
   // Plugin (bridge-token) routes — the OpenClaw plugin uses these to drive
@@ -385,8 +410,13 @@ export function createApp(deps: RouteDeps): Hono {
   const pluginAuth = requirePluginAuth(deps.database);
 
   app.post("/api/plugin/conversations", pluginAuth, async (c) => {
+    const bridgeTokenId = c.get("bridgeTokenId" as never) as string;
+    const openclaw = deps.database.getOpenClawInstanceByTokenId(bridgeTokenId);
     const body = createConversationSchema.parse(await readJson(c.req.raw));
-    const conversation = deps.database.createConversation(body);
+    const conversation = deps.database.createConversation({
+      ...body,
+      openclawInstanceId: body.openclawInstanceId ?? openclaw?.id ?? null
+    });
     deps.events.publish({
       direction: "out",
       type: "conversation.created",
@@ -507,6 +537,11 @@ function buildInboundText(text: string, attachments: Array<{ filename: string; c
     "[LobsterPot attachments]",
     ...lines
   ].filter((line, index) => index !== 0 || line.trim().length > 0).join("\n");
+}
+
+function withoutToken<T extends { token?: string }>(input: T): Omit<T, "token"> {
+  const { token: _token, ...rest } = input;
+  return rest;
 }
 
 function adminHtml(bridgeUrl: string, pluginConnected: boolean): string {

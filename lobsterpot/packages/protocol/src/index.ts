@@ -35,6 +35,7 @@ export const bridgeTokenCreatedSchema = z.object({
 
 export const conversationSchema = z.object({
   id: z.string().uuid(),
+  openclawInstanceId: z.string().uuid().optional().nullable(),
   title: z.string().min(1),
   purpose: z.string().optional().nullable(),
   kind: conversationKindSchema,
@@ -42,6 +43,16 @@ export const conversationSchema = z.object({
   openclawAgentId: z.string().optional().nullable(),
   pinned: z.boolean(),
   archivedAt: isoTimestampSchema.optional().nullable(),
+  createdAt: isoTimestampSchema,
+  updatedAt: isoTimestampSchema
+});
+
+export const openclawInstanceSchema = z.object({
+  id: z.string().uuid(),
+  name: z.string().min(1),
+  connected: z.boolean().default(false),
+  capabilities: z.array(z.string()).default([]),
+  lastSeenAt: isoTimestampSchema.optional().nullable(),
   createdAt: isoTimestampSchema,
   updatedAt: isoTimestampSchema
 });
@@ -79,6 +90,7 @@ export const pluginHelloSchema = z.object({
   protocol: z.literal(LOBSTERPOT_PROTOCOL_VERSION),
   channel: z.literal("lobsterpot"),
   instanceId: z.string().min(1),
+  instanceName: z.string().optional(),
   token: z.string().startsWith("lobsterpot_"),
   capabilities: z.array(z.string()).default([]),
   resumeCursor: z.string().optional()
@@ -109,6 +121,7 @@ export const inboundMessageSchema = z.object({
     conversationTitle: z.string().optional(),
     conversationPurpose: z.string().optional().nullable(),
     conversationKind: conversationKindSchema.optional(),
+    openclawInstanceId: z.string().uuid().optional().nullable(),
     openclawSessionKey: z.string().optional().nullable(),
     openclawAgentId: z.string().optional().nullable(),
     attachments: z.array(attachmentSchema).optional()
@@ -216,6 +229,7 @@ export const publicBridgeEventSchema = z.object({
 
 export type BridgeTokenCreated = z.infer<typeof bridgeTokenCreatedSchema>;
 export type Conversation = z.infer<typeof conversationSchema>;
+export type OpenClawInstance = z.infer<typeof openclawInstanceSchema>;
 export type Attachment = z.infer<typeof attachmentSchema>;
 export type Message = z.infer<typeof messageSchema>;
 export type PluginConnectionStatus = z.infer<typeof pluginConnectionStatusSchema>;

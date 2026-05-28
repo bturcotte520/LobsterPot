@@ -19,6 +19,8 @@ final class AppState: ObservableObject {
 
     // MARK: - Conversations / messages (active workspace only)
     @Published var conversations: [LPConversation] = []
+    @Published var openclaws: [OpenClawInstance] = []
+    @Published var activeOpenClawId: String?
     @Published var archivedConversations: [LPConversation] = []
     @Published var selectedConversationId: String?
     @Published var messages: [String: [LPMessage]] = [:]
@@ -51,6 +53,10 @@ final class AppState: ObservableObject {
     var isSetupComplete: Bool { !workspaceStore.workspaces.isEmpty }
     var activeWorkspace: Workspace? { workspaceStore.activeWorkspace }
     var activeWorkspaceId: UUID? { workspaceStore.activeWorkspaceId }
+    var activeOpenClaw: OpenClawInstance? {
+        guard let activeOpenClawId else { return nil }
+        return openclaws.first { $0.id == activeOpenClawId }
+    }
 
     private static let appearanceModeKey = "appearance_mode_v1"
 
@@ -115,6 +121,7 @@ final class AppState: ObservableObject {
         }
 
         Task {
+            await refreshOpenClaws()
             await refreshConversations()
             await checkStatus()
             await registerPendingPushTokenIfNeeded()
@@ -128,6 +135,8 @@ final class AppState: ObservableObject {
         isConnected = false
         pluginConnected = false
         conversations = []
+        openclaws = []
+        activeOpenClawId = nil
         messages = [:]
         archivedConversations = []
         mutedConversationIds = []
@@ -145,7 +154,7 @@ final class AppState: ObservableObject {
         isLoadingConversations = true
         defer { isLoadingConversations = false }
         do {
-            let resp = try await client.getConversations()
+            let resp = try await client.getConversations(openclawInstanceId: activeOpenClawId)
             conversations = sortConversations(resp.conversations)
             loadMutedConversationIds()
             seedSurfacedCreatedConversationIds(from: resp.conversations)
@@ -157,10 +166,44 @@ final class AppState: ObservableObject {
     func refreshArchivedConversations() async {
         guard let client = bridgeClient else { return }
         do {
-            let resp = try await client.getConversations(archived: true)
+            let resp = try await client.getConversations(archived: true, openclawInstanceId: activeOpenClawId)
             archivedConversations = sortConversations(resp.conversations)
         } catch {
             lastError = error.localizedDescription
+        }
+    }
+
+    func refreshOpenClaws() async {
+        guard let client = bridgeClient else { return }
+        do {
+            let resp = try await client.getOpenClaws()
+            openclaws = resp.openclaws
+            if activeOpenClawId == nil || !resp.openclaws.contains(where: { $0.id == activeOpenClawId }) {
+                activeOpenClawId = resp.openclaws.first?.id
+            }
+        } catch {
+            openclaws = []
+        }
+    }
+
+    func switchOpenClaw(to id: String) async {
+        guard id != activeOpenClawId else { return }
+        activeOpenClawId = id
+        messages = [:]
+        await refreshConversations()
+    }
+
+    func createOpenClaw(name: String) async -> CreateOpenClawResponse? {
+        guard let client = bridgeClient else { return nil }
+        do {
+            let created = try await client.createOpenClaw(name: name)
+            openclaws.append(created.openclaw)
+            activeOpenClawId = created.openclaw.id
+            await refreshConversations()
+            return created
+        } catch {
+            lastError = error.localizedDescription
+            return nil
         }
     }
 
@@ -172,7 +215,7 @@ final class AppState: ObservableObject {
             return
         }
         do {
-            searchResults = try await client.search(query: trimmed)
+            searchResults = try await client.search(query: trimmed, openclawInstanceId: activeOpenClawId)
         } catch {
             lastError = error.localizedDescription
         }
@@ -185,7 +228,7 @@ final class AppState: ObservableObject {
     ) async -> LPConversation? {
         guard let client = bridgeClient else { return nil }
         do {
-            let resp = try await client.createConversation(title: title, purpose: purpose, kind: kind.rawValue)
+            let resp = try await client.createConversation(title: title, purpose: purpose, kind: kind.rawValue, openclawInstanceId: activeOpenClawId)
             conversations.insert(resp.conversation, at: 0)
             return resp.conversation
         } catch {
@@ -597,7 +640,7 @@ final class AppState: ObservableObject {
         if let idx = conversations.firstIndex(where: { $0.id == id }) {
             var conv = conversations[idx]
             conv = LPConversation(
-                id: conv.id, title: conv.title, purpose: conv.purpose,
+                id: conv.id, openclawInstanceId: conv.openclawInstanceId, title: conv.title, purpose: conv.purpose,
                 kind: conv.kind, openclawSessionKey: conv.openclawSessionKey,
                 openclawAgentId: conv.openclawAgentId, pinned: conv.pinned,
                 archivedAt: conv.archivedAt,
